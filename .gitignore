@@ -1,0 +1,8 @@
+flasher/assets/
+build/
+dist/
+data/
+.pio/
+__pycache__/
+*.spec
+tests/_work/

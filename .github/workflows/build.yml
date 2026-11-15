@@ -1,0 +1,90 @@
+name: Build C3Hole
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"          # weekly: fresh blocklist (and a fresh flasher .exe that contains it)
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  BLOCKLIST_SOURCES: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"
+  BLOCKLIST_EXTRA_ARGS: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/run_tests.sh
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio esptool==4.8.1 pyserial pyinstaller cryptography
+
+      - name: CA bundle for HTTPS updates
+        run: python tools/make_ca_bundle.py
+
+      - name: Build blocklist
+        shell: bash
+        run: |
+          mkdir -p build
+          python tools/build_blocklist.py build/blocklist.bin $BLOCKLIST_SOURCES $BLOCKLIST_EXTRA_ARGS
+
+      - name: Build firmware
+        run: pio run -e c3
+
+      - name: Collect assets
+        run: python ci/collect_assets.py build/blocklist.bin flasher/assets
+
+      - name: Self-test (from source)
+        run: python flasher/app.py --selftest
+
+      - name: Build flasher exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name C3HoleFlasher
+          --paths tools --paths flasher --add-data "flasher/assets;assets" --collect-all esptool
+          flasher/app.py
+
+      - name: Self-test (built exe)
+        shell: pwsh
+        run: |
+          $env:C3F_SELFTEST_OUT = "$PWD\selftest.txt"
+          $p = Start-Process -FilePath "dist\C3HoleFlasher.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { throw "exe self-test failed" }
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp dist/C3HoleFlasher.exe release/
+          cp build/blocklist.bin release/blocklist.bin
+          cp .pio/build/c3/firmware.bin release/firmware.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: C3Hole
+          path: release/*
+
+      - name: Publish rolling release (flasher + OTA files)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --title "C3Hole (latest)" --notes "Flasher .exe, blocklist.bin and firmware.bin for OTA. Rebuilt weekly."
+          gh release upload latest release/C3HoleFlasher.exe release/blocklist.bin release/firmware.bin --clobber
