@@ -48,6 +48,12 @@ static bool setupMode = false;
 static bool wifiUp = false;
 static uint32_t rebootAtMs = 0;
 
+// diagnostics shown on the dashboard
+static uint32_t wifiDrops = 0;
+static uint8_t lastDiscReason = 0;
+static uint32_t lowHeapEvents = 0;
+static uint32_t wifiDownSince = 0, lastWifiKick = 0;
+
 // ------------------------------------------------------------------ small helpers
 static String jsonEsc(const char* s) {
   String o;
@@ -77,6 +83,42 @@ static bool parseIp(const String& s, uint32_t& out) {
   out = (uint32_t)ip;  // network byte order, same layout as in_addr
   return true;
 }
+
+// "192.168.0.5" or "192.168.0.5:5353" (your own resolver, e.g. AdGuard Home / Unbound / Pi-hole).
+static bool parseUpstream(const String& s, uint32_t& ip, uint16_t& port) {
+  int colon = s.indexOf(':');
+  String host = colon >= 0 ? s.substring(0, colon) : s;
+  long p = 53;
+  if (colon >= 0) {
+    String ps = s.substring(colon + 1);
+    if (ps.length() < 1 || ps.length() > 5) return false;
+    for (size_t i = 0; i < ps.length(); i++) if (ps[i] < '0' || ps[i] > '9') return false;
+    p = ps.toInt();
+    if (p < 1 || p > 65535) return false;
+  }
+  uint32_t a;
+  if (!parseIp(host, a) || a == 0) return false;
+  ip = a;
+  port = (uint16_t)p;
+  return true;
+}
+
+static const char* resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_SW: return "software restart";
+    case ESP_RST_PANIC: return "CRASH (panic)";
+    case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: return "watchdog reset";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (weak power)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_EXT: return "reset button";
+    default: return "unknown";
+  }
+}
+
+static void applyRadio();
+static void applyUpstreams();
+static void applyLwipDns();
 
 // ------------------------------------------------------------------ config storage
 static bool loadConfig() {
@@ -128,11 +170,11 @@ static uint32_t blCapacity() { return partBl ? (uint32_t)((partBl->size - c3::BL
 static uint32_t effectiveBloomBytes() {
   uint32_t kb = cfg.bloomKb;
   uint32_t freeKb = ESP.getFreeHeap() / 1024;
-  if (kb == 0) {  // automatic: use what is left after a 96 KB runtime reserve
-    kb = freeKb > 96 ? freeKb - 96 : 0;
+  if (kb == 0) {  // automatic: use what is left after a 100 KB runtime reserve
+    kb = freeKb > 100 ? freeKb - 100 : 0;
     if (kb > 256) kb = 256;
   } else {
-    uint32_t cap = freeKb > 48 ? freeKb - 48 : 0;  // never starve the web server / TLS
+    uint32_t cap = freeKb > 64 ? freeKb - 64 : 0;  // keep 64 KB for Wi-Fi buffers, lwIP, web server, TLS
     if (kb > cap) kb = cap;
   }
   return kb >= 4 ? kb * 1024 : 0;
@@ -466,7 +508,22 @@ static bool startUpdate(UpdKind k) {
 static uint32_t lockUntilMs = 0;
 static uint8_t authFails = 0;
 
+// With no password set, only accept requests addressed to an IP or to <hostname>.local
+// (blocks DNS-rebinding attacks from web pages that resolve an attacker name to this device).
+static bool hostAllowed() {
+  String h = web.header("Host");
+  int colon = h.indexOf(':');
+  if (colon >= 0) h = h.substring(0, colon);
+  h.toLowerCase();
+  IPAddress ip;
+  if (ip.fromString(h)) return true;
+  String mine = String(cfg.host);
+  mine.toLowerCase();
+  return h == mine + ".local" || h == mine;
+}
+
 static bool authorized() {
+  if (cfg.noAuth) return hostAllowed();
   if (!cfg.dashHash[0]) return false;
   if (lockUntilMs != 0 && (int32_t)(millis() - lockUntilMs) < 0) return false;
   String h = web.header("Authorization");
@@ -513,7 +570,11 @@ static String statusJson() {
   const esp_partition_t* run = esp_ota_get_running_partition();
   j += run ? run->label : "?";
   j += "\",\"uptime\":" + String((uint32_t)(millis() / 1000));
-  j += ",\"heap\":{\"free\":" + String(ESP.getFreeHeap()) + ",\"min\":" + String(ESP.getMinFreeHeap()) + "}";
+  j += ",\"heap\":{\"free\":" + String(ESP.getFreeHeap()) + ",\"min\":" + String(ESP.getMinFreeHeap()) + ",\"maxblk\":" +
+       String(ESP.getMaxAllocHeap()) + "}";
+  j += ",\"sys\":{\"reset\":\"" + String(resetReasonText()) + "\",\"temp\":" + String(temperatureRead(), 1) + ",\"cpu\":" +
+       String(getCpuFrequencyMhz()) + ",\"drops\":" + String(wifiDrops) + ",\"disc\":" + String((unsigned)lastDiscReason) +
+       ",\"lowheap\":" + String(lowHeapEvents) + "}";
   j += ",\"wifi\":{\"ssid\":\"" + jsonEsc(WiFi.SSID().c_str()) + "\",\"rssi\":" + String(WiFi.RSSI()) + ",\"ip\":\"" +
        WiFi.localIP().toString() + "\"}";
   j += ",\"dns\":{\"total\":" + String(d.total) + ",\"blocked\":" + String(d.blocked) + ",\"forwarded\":" + String(d.forwarded) +
@@ -529,7 +590,9 @@ static String statusJson() {
   j += ",\"upd\":{\"busy\":" + String(upd.busy ? "true" : "false") + ",\"pct\":" + String((unsigned)upd.pct) + ",\"msg\":\"" +
        jsonEsc(upd.msg) + "\"}";
   j += ",\"cfg\":{\"up1\":\"" + jsonEsc(cfg.up1) + "\",\"up2\":\"" + jsonEsc(cfg.up2) + "\",\"bloomkb\":" + String(cfg.bloomKb) +
-       ",\"blurl\":\"" + jsonEsc(cfg.blUrl) + "\",\"blhours\":" + String(cfg.blHours) + ",\"fwurl\":\"" + jsonEsc(cfg.fwUrl) + "\"}";
+       ",\"blurl\":\"" + jsonEsc(cfg.blUrl) + "\",\"blhours\":" + String(cfg.blHours) + ",\"fwurl\":\"" + jsonEsc(cfg.fwUrl) + "\"" +
+       ",\"txpower\":" + String((unsigned)cfg.txPower) + ",\"ps\":" + String((unsigned)cfg.psMode) + ",\"cpu\":" + String(cfg.cpuMhz) +
+       ",\"upmode\":" + String((unsigned)cfg.upMode) + ",\"uptmo\":" + String(cfg.upTimeoutMs) + ",\"noauth\":" + String(cfg.noAuth ? "true" : "false") + "}";
   char recent[c3::DnsServer::kRecent][c3::DnsServer::kRecentLen];
   size_t rn = dnsServer.recentBlocked(recent, c3::DnsServer::kRecent);
   j += ",\"recent\":[";
@@ -561,12 +624,23 @@ static void handleStatus() {
 static void handleConfig() {
   if (!guard(true)) return;
   String up1 = web.arg("up1"), up2 = web.arg("up2"), blurl = web.arg("blurl"), fwurl = web.arg("fwurl");
+  up1.trim(); up2.trim();
   uint32_t ip1 = 0, ip2 = 0;
-  if (!parseIp(up1, ip1)) { web.send(400, "text/plain", "Upstream DNS 1 is not a valid IPv4 address"); return; }
-  if (up2.length() && !parseIp(up2, ip2)) { web.send(400, "text/plain", "Upstream DNS 2 is not a valid IPv4 address"); return; }
+  uint16_t port1 = 53, port2 = 53;
+  if (!parseUpstream(up1, ip1, port1)) { web.send(400, "text/plain", "Upstream 1 must be an IPv4 address, optionally with :port (e.g. 192.168.0.5:5353)"); return; }
+  if (up2.length() && !parseUpstream(up2, ip2, port2)) { web.send(400, "text/plain", "Upstream 2 must be an IPv4 address, optionally with :port"); return; }
+  uint32_t me = (uint32_t)WiFi.localIP();
+  if ((ip1 == me && port1 == 53) || (ip2 == me && port2 == 53)) { web.send(400, "text/plain", "An upstream cannot be this device itself (that would loop)"); return; }
   if (!validUrl(blurl) || !validUrl(fwurl)) { web.send(400, "text/plain", "URLs must start with http:// or https:// (max 159 chars)"); return; }
   long kb = web.arg("bloomkb").toInt(), hrs = web.arg("blhours").toInt();
+  long txp = web.arg("txpower").toInt(), ps = web.arg("ps").toInt(), cpu = web.arg("cpu").toInt();
+  long upm = web.arg("upmode").toInt(), tmo = web.arg("uptmo").toInt();
   if (kb < 0 || kb > 400 || hrs < 0 || hrs > 8760) { web.send(400, "text/plain", "Bloom KB 0-400, hours 0-8760"); return; }
+  if (!c3::Config::validTxPower(txp)) { web.send(400, "text/plain", "Unsupported TX power value"); return; }
+  if (ps < 0 || ps > 2 || (cpu != 80 && cpu != 160) || (upm != 0 && upm != 1) || tmo < 100 || tmo > 5000) {
+    web.send(400, "text/plain", "Invalid power-save, CPU or upstream-mode value (timeout 100-5000 ms)");
+    return;
+  }
   bool bloomChanged = (uint16_t)kb != cfg.bloomKb;
   c3::Config::copy(cfg.up1, sizeof(cfg.up1), up1.c_str());
   c3::Config::copy(cfg.up2, sizeof(cfg.up2), up2.c_str());
@@ -574,8 +648,15 @@ static void handleConfig() {
   c3::Config::copy(cfg.fwUrl, sizeof(cfg.fwUrl), fwurl.c_str());
   cfg.bloomKb = (uint16_t)kb;
   cfg.blHours = (uint16_t)hrs;
+  cfg.txPower = (uint8_t)txp;
+  cfg.psMode = (uint8_t)ps;
+  cfg.cpuMhz = (uint16_t)cpu;  // takes effect after the next reboot
+  cfg.upMode = (uint8_t)upm;
+  cfg.upTimeoutMs = (uint16_t)tmo;
   if (!saveConfig()) { web.send(500, "text/plain", "Could not save settings"); return; }
-  dnsServer.setUpstreams(ip1, ip2);
+  applyUpstreams();
+  applyLwipDns();
+  applyRadio();
   nextBlUpdateMs = millis() + 5000;
   if (bloomChanged && blValid && !upd.busy) restoreBloom();
   web.send(200, "application/json", "{}");
@@ -583,11 +664,20 @@ static void handleConfig() {
 
 static void handlePassword() {
   if (!guard(true)) return;
+  if (web.arg("nopw") == "1") {  // open dashboard: anyone on the LAN can use it
+    cfg.noAuth = true;
+    cfg.dashHash[0] = 0;
+    cfg.dashSalt[0] = 0;
+    if (!saveConfig()) { web.send(500, "text/plain", "Could not save"); return; }
+    web.send(200, "application/json", "{}");
+    return;
+  }
   String pw = web.arg("pw");
   if (pw.length() < 8 || pw.length() > 60 || !c3::Config::validValue(pw.c_str())) { web.send(400, "text/plain", "Password must be 8-60 characters"); return; }
   char salt[17];
   randomHex(salt, 8);
   cfg.setDashPassword(pw.c_str(), salt);
+  cfg.noAuth = false;
   if (!saveConfig()) { web.send(500, "text/plain", "Could not save"); return; }
   web.send(200, "application/json", "{}");
 }
@@ -737,17 +827,23 @@ static void handleSetupPage() {
 
 static void handleSetupSave() {
   String ssid = web.arg("ssid"), wpass = web.arg("wpass"), dpass = web.arg("dpass");
-  if (ssid.length() < 1 || ssid.length() > 32 || wpass.length() > 63 || dpass.length() < 8 || dpass.length() > 60 ||
-      !c3::Config::validValue(ssid.c_str()) || !c3::Config::validValue(wpass.c_str()) || !c3::Config::validValue(dpass.c_str())) {
-    web.send(400, "text/plain", "Check the fields: SSID 1-32, dashboard password 8-60 characters.");
+  bool nopw = web.arg("nopw") == "1";
+  if (ssid.length() < 1 || ssid.length() > 32 || wpass.length() > 63 || dpass.length() > 60 ||
+      !c3::Config::validValue(ssid.c_str()) || !c3::Config::validValue(wpass.c_str()) || !c3::Config::validValue(dpass.c_str()) ||
+      (!nopw && dpass.length() < 8)) {
+    web.send(400, "text/plain", "Check the fields: SSID 1-32 characters; dashboard password 8-60 characters, or tick 'no password'.");
     return;
   }
   cfg.clear();
   c3::Config::copy(cfg.ssid, sizeof(cfg.ssid), ssid.c_str());
   c3::Config::copy(cfg.wifiPass, sizeof(cfg.wifiPass), wpass.c_str());
-  char salt[17];
-  randomHex(salt, 8);
-  cfg.setDashPassword(dpass.c_str(), salt);
+  if (nopw) {
+    cfg.noAuth = true;
+  } else {
+    char salt[17];
+    randomHex(salt, 8);
+    cfg.setDashPassword(dpass.c_str(), salt);
+  }
   if (!saveConfig()) { web.send(500, "text/plain", "Could not save settings"); return; }
   web.send(200, "text/html", "<meta name=viewport content='width=device-width'><h3>Saved.</h3><p>Restarting and joining your Wi-Fi...</p>");
   rebootAtMs = millis() + 1500;
@@ -755,12 +851,31 @@ static void handleSetupSave() {
 
 // ------------------------------------------------------------------ networking
 static void applyLwipDns() {
-  IPAddress ip;
-  if (ip.fromString(cfg.up1)) {
-    ip_addr_t d;
-    IP_ADDR4(&d, ip[0], ip[1], ip[2], ip[3]);
-    dns_setserver(0, &d);  // the device itself must not depend on its own DNS sinkhole
-  }
+  // The device itself (NTP, update downloads) must not depend on its own DNS sinkhole, and lwIP can only
+  // use port 53: take the first configured upstream on port 53, else a public resolver.
+  uint32_t ip = 0;
+  uint16_t port = 53;
+  if (!(parseUpstream(cfg.up1, ip, port) && port == 53) && !(cfg.up2[0] && parseUpstream(cfg.up2, ip, port) && port == 53))
+    ip = IPAddress(8, 8, 8, 8);
+  IPAddress a(ip);
+  ip_addr_t d;
+  IP_ADDR4(&d, a[0], a[1], a[2], a[3]);
+  dns_setserver(0, &d);
+}
+
+static void applyRadio() {
+  WiFi.setTxPower((wifi_power_t)cfg.txPower);
+  WiFi.setSleep(cfg.psMode == 0 ? WIFI_PS_NONE : cfg.psMode == 1 ? WIFI_PS_MIN_MODEM : WIFI_PS_MAX_MODEM);
+}
+
+static void applyUpstreams() {
+  uint32_t i1 = 0, i2 = 0;
+  uint16_t p1 = 53, p2 = 53;
+  parseUpstream(cfg.up1, i1, p1);
+  if (cfg.up2[0]) parseUpstream(cfg.up2, i2, p2);
+  dnsServer.setUpstreamEndpoints(i1, p1, i2, p2);
+  dnsServer.setParallel(cfg.upMode == 1);
+  dnsServer.setTimeoutMs(cfg.upTimeoutMs);
 }
 
 static void dnsTask(void*) {
@@ -768,10 +883,11 @@ static void dnsTask(void*) {
 }
 
 static void startDns() {
-  uint32_t ip1 = 0, ip2 = 0;
-  parseIp(cfg.up1, ip1);
-  parseIp(cfg.up2, ip2);
-  if (dnsServer.begin(53, ip1, ip2)) {
+  uint32_t ip1 = 0;
+  uint16_t p1 = 53;
+  parseUpstream(cfg.up1, ip1, p1);
+  if (dnsServer.begin(53, ip1, 0)) {
+    applyUpstreams();
     xTaskCreate(dnsTask, "dns", 6144, nullptr, 5, nullptr);
     Serial.println("[c3hole] DNS server listening on :53");
   } else {
@@ -781,24 +897,32 @@ static void startDns() {
 
 static void onWifiUp() {
   Serial.printf("[c3hole] ip=%s\n", WiFi.localIP().toString().c_str());
+  applyRadio();
   applyLwipDns();
   configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+  MDNS.end();  // the responder stops answering after a reconnect unless it is restarted
   MDNS.begin(cfg.host);
   MDNS.addService("http", "tcp", 80);
   if (!dnsServer.running()) startDns();
+}
+
+static void onWifiEvent(arduino_event_id_t ev, arduino_event_info_t info) {
+  if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) lastDiscReason = info.wifi_sta_disconnected.reason;
 }
 
 static void startStation() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(cfg.host);
-  WiFi.setSleep(false);  // power-save would add latency to every DNS reply
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent(onWifiEvent);
   WiFi.begin(cfg.ssid, cfg.wifiPass);
+  applyRadio();
 }
 
 static void registerRoutes() {
-  static const char* hdrs[] = {"Authorization", "X-C3H"};
-  web.collectHeaders(hdrs, 2);
+  static const char* hdrs[] = {"Authorization", "X-C3H", "Host"};
+  web.collectHeaders(hdrs, 3);
   if (setupMode) {
     web.on("/", HTTP_GET, handleSetupPage);
     web.on("/setup", HTTP_POST, handleSetupSave);
@@ -835,6 +959,7 @@ void setup() {
 
   bool haveCfg = loadConfig();
   setupMode = !(haveCfg && cfg.configured());
+  if (haveCfg && cfg.cpuMhz == 80) setCpuFrequencyMhz(80);  // cooler; 160 MHz is the boot default
 
   if (setupMode) {
     Serial.println("[c3hole] not configured: starting setup access point 'C3Hole-Setup' (http://192.168.4.1)");
@@ -876,8 +1001,43 @@ void loop() {
     lastTick = now;
     bool up = WiFi.status() == WL_CONNECTED;
     if (up && !wifiUp) onWifiUp();
+    if (!up && wifiUp) {
+      wifiDrops++;
+      Serial.printf("[c3hole] Wi-Fi lost (reason %u), waiting for automatic reconnect\n", (unsigned)lastDiscReason);
+    }
     wifiUp = up;
-    if (!up) WiFi.reconnect();
+    // The stack reconnects by itself (setAutoReconnect). Never call WiFi.reconnect() in a tight loop: that restarts the
+    // attempt every time and a brief outage becomes permanent. Only step in after a long outage, then restart.
+    if (up) {
+      wifiDownSince = 0;
+    } else {
+      if (!wifiDownSince) wifiDownSince = now ? now : 1;
+      uint32_t down = now - wifiDownSince;
+      if (down > 45000UL && now - lastWifiKick > 45000UL) {
+        lastWifiKick = now;
+        Serial.println("[c3hole] Wi-Fi down for 45 s: restarting the connection attempt");
+        WiFi.disconnect(false, false);
+        WiFi.begin(cfg.ssid, cfg.wifiPass);
+        applyRadio();
+      }
+      if (down > 300000UL) { Serial.println("[c3hole] Wi-Fi down for 5 min: rebooting"); delay(100); ESP.restart(); }
+    }
+
+    // Memory guard: if the heap runs low, give the Bloom filter back so the network stack keeps working.
+    uint32_t freeHeap = ESP.getFreeHeap();
+    static uint8_t lowCount = 0;
+    if (freeHeap < 30 * 1024UL && !upd.busy) {
+      if (++lowCount >= 5 && matcher.hasBloom()) {
+        matcher.dropBloom();
+        lowHeapEvents++;
+        Serial.printf("[c3hole] low heap (%u B): Bloom filter released\n", (unsigned)freeHeap);
+      }
+    } else {
+      lowCount = 0;
+    }
+    if ((now / 1000) % 60 == 0)
+      Serial.printf("[c3hole] up=%us heap=%u min=%u maxblk=%u rssi=%d drops=%u\n", (unsigned)(now / 1000), (unsigned)freeHeap,
+                    (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.RSSI(), (unsigned)wifiDrops);
     if (now < 120000UL && up && (now / 1000) % 5 == 0) Serial.printf("[c3hole] ip=%s\n", WiFi.localIP().toString().c_str());
 
     if (up && cfg.blUrl[0] && cfg.blHours > 0 && !upd.busy && (int32_t)(now - nextBlUpdateMs) >= 0) {

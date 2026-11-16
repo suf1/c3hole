@@ -29,4 +29,7 @@ with open(os.path.join(W, "vectors.txt"), "w") as f:
 blob = cfgblob.build_cfg("My Home WiFi", "p@ss=w0rd!", "Dash-Pass-123", bloom_kb=96,
                          bl_url="https://example.org/a.bin", fw_url="", bl_hours=12, salt="0123456789abcdef")
 open(os.path.join(W, "cfg.bin"), "wb").write(blob)
+blob2 = cfgblob.build_cfg("Open Net", "", "", no_auth=True, tx_power=34, ps_mode=1, cpu_mhz=80, up1="192.168.0.5:5353",
+                          up2="", up_mode=1, up_timeout=350)
+open(os.path.join(W, "cfg_open.bin"), "wb").write(blob2)
 print("fixtures ready")

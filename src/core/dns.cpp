@@ -84,7 +84,7 @@ uint32_t DnsServer::nowMs() {
 }
 
 DnsServer::DnsServer(Matcher& matcher, uint32_t (*rng)())
-    : matcher_(matcher), rng_(rng), srv_(-1), up_(-1), up1_(0), up2_(0), timeoutMs_(1500), upPort_(53),
+    : matcher_(matcher), rng_(rng), srv_(-1), up_(-1), up1_(0), up2_(0), timeoutMs_(1500), up1Port_(53), up2Port_(53), parallel_(false),
       recentHead_(0), recentCount_(0) {
   lastRead_ = false;
   memset(slots_, 0, sizeof(slots_));
@@ -132,6 +132,11 @@ void DnsServer::end() {
 }
 
 void DnsServer::setUpstreams(uint32_t up1, uint32_t up2) { up1_ = up1; up2_ = up2; }
+
+void DnsServer::setUpstreamEndpoints(uint32_t ip1, uint16_t port1, uint32_t ip2, uint16_t port2) {
+  up1_ = ip1; up1Port_ = port1 ? port1 : 53;
+  up2_ = ip2; up2Port_ = port2 ? port2 : 53;
+}
 
 int DnsServer::pending() const {
   int n = 0;
@@ -274,8 +279,13 @@ void DnsServer::forward(uint8_t* pkt, size_t n, uint32_t ip, uint16_t port) {
   memset(&to, 0, sizeof(to));
   to.sin_family = AF_INET;
   to.sin_addr.s_addr = up1_;
-  to.sin_port = htons(upPort_);
+  to.sin_port = htons(up1Port_);
   sendto(up_, pkt, n, 0, (sockaddr*)&to, sizeof(to));
+  if (parallel_ && up2_) {                                  // ask the secondary at the same time
+    to.sin_addr.s_addr = up2_;
+    to.sin_port = htons(up2Port_);
+    sendto(up_, pkt, n, 0, (sockaddr*)&to, sizeof(to));
+  }
   st_.forwarded++;
 }
 
@@ -285,7 +295,9 @@ void DnsServer::onUpstream() {
   ssize_t n = recvfrom(up_, buf_, sizeof(buf_), 0, (sockaddr*)&from, &fl);
   lastRead_ = n > 0;
   if (n < 12) return;
-  if (from.sin_addr.s_addr != up1_ && from.sin_addr.s_addr != up2_) return;  // not from our upstreams
+  bool fromUp1 = from.sin_addr.s_addr == up1_ && from.sin_port == htons(up1Port_);
+  bool fromUp2 = up2_ && from.sin_addr.s_addr == up2_ && from.sin_port == htons(up2Port_);
+  if (!fromUp1 && !fromUp2) return;                                           // not from our upstreams
   uint16_t id = be16(buf_);
   Slot& s = slots_[id & (kSlots - 1)];
   if (!s.used || s.upId != id) return;                                        // stale or spoofed
@@ -295,9 +307,9 @@ void DnsServer::onUpstream() {
   to.sin_family = AF_INET;
   to.sin_addr.s_addr = s.clientIp;
   to.sin_port = s.clientPort;
-  sendto(srv_, buf_, (size_t)n, 0, (sockaddr*)&to, sizeof(to));
-  s.used = false;
+  s.used = false;                // release the slot and count first: the client may read the stats the moment it gets the reply
   st_.answered++;
+  sendto(srv_, buf_, (size_t)n, 0, (sockaddr*)&to, sizeof(to));
 }
 
 void DnsServer::sweep() {
@@ -305,12 +317,12 @@ void DnsServer::sweep() {
   for (int i = 0; i < kSlots; i++) {
     Slot& s = slots_[i];
     if (!s.used || (now - s.tsMs) < timeoutMs_) continue;
-    if (s.tries == 0 && up2_ && s.qlen) {
+    if (!parallel_ && s.tries == 0 && up2_ && s.qlen) {
       sockaddr_in to;
       memset(&to, 0, sizeof(to));
       to.sin_family = AF_INET;
       to.sin_addr.s_addr = up2_;
-      to.sin_port = htons(upPort_);
+      to.sin_port = htons(up2Port_);
       sendto(up_, s.q, s.qlen, 0, (sockaddr*)&to, sizeof(to));
       s.tries = 1;
       s.tsMs = now;

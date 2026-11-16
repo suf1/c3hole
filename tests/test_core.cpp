@@ -193,6 +193,22 @@ static void testConfig() {
   uint8_t blank[64]; memset(blank, 0xFF, sizeof(blank));
   CHECK(!d.parse(blank, sizeof(blank)), "erased flash is not a config");
   Config e; CHECK(!e.configured(), "default config is unconfigured");
+  CHECK(c.txPower == 44 && c.psMode == 0 && c.cpuMhz == 160 && !c.noAuth && c.upMode == 0 && c.upTimeoutMs == 800, "new-setting defaults");
+  CHECK(!strcmp(c.up1, "8.8.8.8"), "default upstream 1 '%s'", c.up1);
+  {
+    std::vector<uint8_t> ob = readFile(W + "cfg_open.bin");
+    Config o;
+    CHECK(o.parse(ob.data(), ob.size()), "parse open-dashboard blob");
+    CHECK(o.noAuth && o.configured() && !o.dashHash[0], "no-password config counts as configured");
+    CHECK(!o.checkDashPassword("") && !o.checkDashPassword("x"), "no hash stored -> checkDashPassword never matches");
+    CHECK(o.txPower == 34 && o.psMode == 1 && o.cpuMhz == 80 && o.upMode == 1 && o.upTimeoutMs == 350, "power/cpu/upstream-mode values");
+    CHECK(!strcmp(o.up1, "192.168.0.5:5353") && o.up2[0] == 0, "own upstream with custom port '%s'", o.up1);
+    uint8_t rt[CFG_PART_SIZE];
+    CHECK(o.serialize(rt, sizeof(rt)) > 0, "serialize open config");
+    Config o2; CHECK(o2.parse(rt, sizeof(rt)) && o2.noAuth && o2.txPower == 34 && !strcmp(o2.up1, "192.168.0.5:5353"), "open config roundtrip");
+    Config bad; uint8_t junk[64]; memset(junk, 0xFF, sizeof(junk)); memcpy(junk, "C3CFG1\ntxpower=99\ncpu=123\nps=9\nuptmo=1\n\0", 38);
+    CHECK(bad.parse(junk, sizeof(junk)) && bad.txPower == 44 && bad.cpuMhz == 160 && bad.psMode == 2 && bad.upTimeoutMs == 100, "invalid values are rejected or clamped");
+  }
   uint8_t tiny[40];
   CHECK(c.serialize(tiny, sizeof(tiny)) == 0, "serialize reports overflow instead of corrupting memory");
 }
@@ -422,6 +438,58 @@ static void testServerRetryTimeoutOverflow() {
   }
 }
 
+static void testOwnUpstreamAndParallel() {
+  printf("[dns server: own upstream on a custom port, parallel mode, port spoofing]\n");
+  {
+    FakeUpstream own("127.0.0.1", 0, 5);                           // "our own" resolver on an unusual port
+    ServerRunner sr(g_matcher, 0, 0, 53, 1000);
+    sr.srv.setUpstreamEndpoints(inet_addr("127.0.0.1"), own.port, 0, 0);
+    Client c(sr.port);
+    uint8_t q[512], r[1500];
+    c.send(q, buildQuery(q, 0x8001, "own.resolver.test", 1, false));
+    int rn = c.recv(r, sizeof(r), 800);
+    CHECK(rn > 0 && r[0] == 0x80 && r[1] == 0x01 && r[7] == 1, "answered by the custom-port upstream");
+  }
+  {
+    FakeUpstream alive("127.0.0.2", 0, 20);                        // primary dead, secondary alive
+    ServerRunner sr(g_matcher, 0, 0, 53, 3000);
+    sr.srv.setUpstreamEndpoints(inet_addr("127.0.0.1"), alive.port, inet_addr("127.0.0.2"), alive.port);
+    sr.srv.setParallel(true);
+    Client c(sr.port);
+    uint8_t q[512], r[1500];
+    uint64_t t0 = nowUs();
+    c.send(q, buildQuery(q, 0x8002, "parallel.test", 1, false));
+    int rn = c.recv(r, sizeof(r), 1500);
+    double ms = (nowUs() - t0) / 1000.0;
+    CHECK(rn > 0 && r[0] == 0x80 && r[1] == 0x02, "parallel: answered");
+    CHECK(ms < 300, "parallel: answered in %.0f ms although the primary is dead and the failover timeout is 3000 ms", ms);
+    CHECK(sr.srv.stats().retried == 0, "parallel mode needs no retry");
+  }
+  {
+    // A reply from the right IP but the wrong source port must be ignored.
+    int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in sa; memset(&sa, 0, sizeof(sa)); sa.sin_family = AF_INET; sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    bind(a, (sockaddr*)&sa, sizeof(sa)); bind(b, (sockaddr*)&sa, sizeof(sa));
+    socklen_t sl = sizeof(sa); getsockname(a, (sockaddr*)&sa, &sl);
+    uint16_t portA = ntohs(sa.sin_port);
+    ServerRunner sr(g_matcher, 0, 0, 53, 600);
+    sr.srv.setUpstreamEndpoints(inet_addr("127.0.0.1"), portA, 0, 0);
+    Client c(sr.port);
+    uint8_t q[512], r[1500], in[1500];
+    c.send(q, buildQuery(q, 0x8003, "spoof.test", 1, false));
+    sockaddr_in from; socklen_t fl = sizeof(from);
+    fd_set rf; FD_ZERO(&rf); FD_SET(a, &rf); timeval tv = {1, 0};
+    int got = select(a + 1, &rf, nullptr, nullptr, &tv) > 0 ? (int)recvfrom(a, in, sizeof(in), 0, (sockaddr*)&from, &fl) : -1;
+    CHECK(got > 12, "fake upstream received the query");
+    in[2] |= 0x80; in[7] = 1;
+    sendto(b, in, (size_t)got, 0, (sockaddr*)&from, fl);          // forged: correct ID, wrong source port
+    CHECK(c.recv(r, sizeof(r), 250) < 0, "reply from the wrong port is ignored");
+    sendto(a, in, (size_t)got, 0, (sockaddr*)&from, fl);          // genuine
+    CHECK(c.recv(r, sizeof(r), 500) > 0, "genuine reply from the configured port is accepted");
+    close(a); close(b);
+  }
+}
+
 int main() {
   testSha();
   testHash();
@@ -436,6 +504,7 @@ int main() {
   testServerConcurrency();
   testServerBlocking();
   testServerRetryTimeoutOverflow();
+  testOwnUpstreamAndParallel();
   printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail ? 1 : 0;
 }

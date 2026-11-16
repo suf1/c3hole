@@ -11,12 +11,12 @@ fits on a bare ESP32-C3 SuperMini.
 | RAM | most of it | ~57 KB static + Bloom filter (default 128 KB, adjustable) |
 | Lookup | string compare | Bloom filter first; flash only on a possible hit (binary search, memory-mapped) |
 | Collisions | n/a | 40-bit hashes; expected < 0.03 collisions at 253K (0 in the test list) |
-| Upstream | blocking, 1 query at a time | async, 32 concurrent, retry on secondary, per-query timeout |
+| Upstream | blocking, 1 query at a time | async, 32 concurrent; failover to a secondary, or ask both at once; your own server (`ip:port`) works |
 | Updates | - | blocklist **and** firmware over the air (HTTPS or upload) |
 
 Domains block their subdomains automatically (`ads.example.com` is blocked when `example.com` is listed).
 
-## Measured on the host test suite (`sh tests/run_tests.sh`, 109 checks)
+## Measured on the host test suite (`sh tests/run_tests.sh`, 126 checks)
 
 * 253,000-domain list: every listed domain found, 0 false blocks in 200,000 random lookups.
 * Share of non-blocked lookups settled by the Bloom filter alone (0 flash reads) at 253K domains:
@@ -26,7 +26,7 @@ Domains block their subdomains automatically (`ads.example.com` is blocked when 
   a bigger filter only saves flash reads.
 * 32 simultaneous queries to a 250 ms upstream finish in ~252 ms (sequential: 8,000 ms).
 * Firmware links against the real Arduino-ESP32 2.0.17 / ESP-IDF 4.4 SDK with the Espressif
-  RISC-V GCC 8.4 toolchain: **1,088,864 bytes in a 1,310,720-byte OTA slot (83 %)**.
+  RISC-V GCC 8.4 toolchain: **1,101,840 bytes in a 1,310,720-byte OTA slot (84 %)**.
 
 ## Flash layout (4 MB)
 
@@ -70,13 +70,53 @@ then **Update firmware from URL**) or by uploading `firmware.bin` in the dashboa
 Flash with the flasher .exe or `esptool` using the offsets above. Without the flasher the device
 starts a setup Wi-Fi `C3Hole-Setup` (http://192.168.4.1) where you enter your Wi-Fi and dashboard password.
 
+## Upstream DNS (including your own server)
+
+Pick a provider preset or type any IPv4 address, optionally with a port: `192.168.0.5` or `192.168.0.5:5353`
+(AdGuard Home, Unbound, Pi-hole, dnsmasq...). Two modes: *primary, then secondary after the failover timeout*
+(default 800 ms) or *ask both at once, first answer wins* (best against a flaky resolver, double the upstream traffic).
+Replies are accepted only from the configured IP **and** port. An upstream cannot be the device itself.
+Default: 8.8.8.8 + 9.9.9.9 (two providers).
+
+## Radio and cooling
+
+* **Wi-Fi transmit power**, 2 to 19.5 dBm (default 11). Lower runs cooler; on SuperMini boards with weak antennas,
+  8.5 dBm often makes Wi-Fi *more* stable.
+* **Wi-Fi power save**: off (fastest, default), minimum or maximum modem sleep (cooler, but adds latency to replies).
+* **CPU speed**: 160 MHz (default) or 80 MHz (cooler; applies after reboot).
+* The dashboard shows chip temperature.
+
 ## Dashboard and safety
 
-* HTTP Basic auth, salted SHA-256 password hash stored (never the password), 5 failed logins = 30 s lockout.
+* Password login (HTTP Basic): salted SHA-256 hash stored, never the password; 5 failed logins = 30 s lockout.
+* **Open dashboard (no password)** is optional: choose "none" in the flasher, tick it on the setup page, or use
+  *Remove password* in the dashboard. Anyone on your Wi-Fi can then change settings and install firmware. In this mode
+  requests are only accepted when addressed to an IP or `<hostname>.local` (blocks DNS-rebinding from web pages).
 * All state-changing requests need an `X-C3H` header (blocks cross-site form posts).
 * The dashboard is plain HTTP on your LAN: do not port-forward it.
 * Hold the BOOT button for 5 s while running to erase all settings.
 * Names shown in "recently blocked" come from network clients and are sanitised.
+
+## If the dashboard disappears after a while
+
+Version 1.0.0 had a bug: after any Wi-Fi drop it called `WiFi.reconnect()` every second, which restarts the connection
+attempt each time, so a brief glitch could become a permanent outage until power-cycled. Fixed: the stack now reconnects by
+itself, the firmware only steps in after 45 s, and reboots after 5 min offline. Also fixed: mDNS (`c3hole.local`)
+stopped answering after a reconnect; the memory reserve was too small (Bloom filter now leaves 64 KB); a low-memory guard
+gives the Bloom filter back if the heap runs short.
+
+If it ever happens again, open the dashboard when it is back and read **System health**:
+
+| Shows | Means |
+|---|---|
+| Last restart reason: BROWNOUT | weak USB power - use a better charger/cable |
+| CRASH (panic) / watchdog | firmware fault - please report with the serial log |
+| Wi-Fi drops, reason 200 / 201 | beacon timeout / AP not found: weak signal, or TX power too high/low for the antenna |
+| Wi-Fi drops, reason 2, 4, 15 | authentication/handshake expired: router or roaming problem |
+| Low-memory events > 0 | heap ran short: lower the Bloom filter size |
+
+With a USB serial monitor attached it also logs a status line every minute and every Wi-Fi loss with its reason code.
+Give the device a DHCP reservation in your router so its IP never changes.
 
 ## Limits you should know
 
@@ -88,7 +128,7 @@ starts a setup Wi-Fi `C3Hole-Setup` (http://192.168.4.1) where you enter your Wi
 
 ## Verification status
 
-Done: 109 automated host checks (hashing, Bloom, matcher, config, DNS packets, real UDP async tests,
+Done: 126 automated host checks (hashing, Bloom, matcher, config, DNS packets, real UDP async tests,
 Python-built lists/config read by the C++ code); full compile + link of the firmware with the real toolchain
 and SDK; partition table validated with Espressif's `gen_esp32part.py`; flasher logic, validation and GUI
 exercised with a simulated esptool.

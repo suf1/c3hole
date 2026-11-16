@@ -72,12 +72,29 @@ def save_settings(d):
 
 
 # --------------------------------------------------------------------- validation
-IPV4 = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+UPSTREAM = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?::(\d{1,5}))?$")
+
+PRESETS = [  # name, upstream 1, upstream 2
+    ("Google (8.8.8.8)", "8.8.8.8", "8.8.4.4"),
+    ("Quad9 (9.9.9.9)", "9.9.9.9", "149.112.112.112"),
+    ("Cloudflare (1.1.1.1)", "1.1.1.1", "1.0.0.1"),
+    ("AdGuard DNS", "94.140.14.14", "94.140.15.15"),
+    ("OpenDNS", "208.67.222.222", "208.67.220.220"),
+    ("Google + Quad9", "8.8.8.8", "9.9.9.9"),
+    ("My own server...", "", ""),
+]
 
 
-def valid_ip(s):
-    m = IPV4.match(s)
-    return bool(m) and all(0 <= int(g) <= 255 for g in m.groups())
+def valid_upstream(s):
+    """'1.2.3.4' or '1.2.3.4:5353' (your own resolver)."""
+    m = UPSTREAM.match(s)
+    if not m:
+        return False
+    if not all(0 <= int(g) <= 255 for g in m.groups()[:4]):
+        return False
+    if m.group(5) is not None and not 1 <= int(m.group(5)) <= 65535:
+        return False
+    return s.split(":")[0] != "0.0.0.0"
 
 
 def validate(v, blocklist_size_limit, blocklist_path=None):
@@ -94,15 +111,15 @@ def validate(v, blocklist_size_limit, blocklist_path=None):
         if re.search(r"[\r\n\x00]", v[name]):
             return "Wi-Fi settings must not contain line breaks."
     dp = v["dash_pass"]
-    if dp:
+    if dp and not v.get("no_auth"):
         if not 8 <= len(dp) <= 60:
             return "Dashboard password must be 8-60 characters."
         if not re.fullmatch(r"[\x20-\x7E]+", dp):
             return "Dashboard password: plain ASCII characters only."
-    if not valid_ip(v["up1"]):
-        return "Upstream DNS 1 is not a valid IPv4 address."
-    if v["up2"] and not valid_ip(v["up2"]):
-        return "Upstream DNS 2 is not a valid IPv4 address."
+    if not valid_upstream(v["up1"]):
+        return "Upstream DNS 1 must be an IPv4 address, optionally with :port (e.g. 192.168.0.5:5353)."
+    if v["up2"] and not valid_upstream(v["up2"]):
+        return "Upstream DNS 2 must be an IPv4 address, optionally with :port."
     for key, label in (("bl_url", "Blocklist URL"), ("fw_url", "Firmware URL")):
         u = v[key]
         if u and (len(u) > 159 or not re.match(r"^https?://\S+$", u)):
@@ -110,12 +127,15 @@ def validate(v, blocklist_size_limit, blocklist_path=None):
     try:
         h = int(v["bl_hours"])
         k = int(v["bloom_kb"])
+        t = int(v["up_timeout"])
     except ValueError:
-        return "Update hours and Bloom KB must be numbers."
+        return "Hours, Bloom KB and failover timeout must be numbers."
     if not 0 <= h <= 8760:
         return "Update interval must be 0-8760 hours."
     if not 0 <= k <= 400:
         return "Bloom filter must be 0-400 KB (0 = automatic)."
+    if not 100 <= t <= 5000:
+        return "Failover timeout must be 100-5000 ms."
     if blocklist_path:
         try:
             with open(blocklist_path, "rb") as f:
@@ -233,9 +253,11 @@ def capture_boot(port, seconds, on_line, stop):
 
 
 def check_login(host, password):
-    """True/False if the dashboard accepts the password, None if unreachable."""
-    token = base64.b64encode(("admin:" + password).encode()).decode()
-    req = urllib.request.Request("http://%s/api/status" % host, headers={"Authorization": "Basic " + token})
+    """True/False if the dashboard accepts the password (None = open dashboard), or None if unreachable."""
+    headers = {}
+    if password:
+        headers["Authorization"] = "Basic " + base64.b64encode(("admin:" + password).encode()).decode()
+    req = urllib.request.Request("http://%s/api/status" % host, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=6) as r:
             return r.status == 200
@@ -249,14 +271,17 @@ def check_login(host, password):
 def flash_job(cfg, q, stop):
     log = lambda s: q.put(("log", s))
     prog = lambda v: q.put(("progress", v))
-    result = {"ip": None, "password": cfg["dash_pass"], "login": None, "generated": cfg["generated"]}
+    result = {"ip": None, "password": None if cfg["no_auth"] else cfg["dash_pass"], "login": None,
+              "generated": cfg["generated"], "no_auth": cfg["no_auth"]}
     try:
         man = load_manifest()
         prog(2)
         log("Building settings partition...")
         blob = cfgblob.build_cfg(cfg["ssid"], cfg["wifi_pass"], cfg["dash_pass"], bloom_kb=int(cfg["bloom_kb"]),
                                  up1=cfg["up1"], up2=cfg["up2"] or "", bl_url=cfg["bl_url"], fw_url=cfg["fw_url"],
-                                 bl_hours=int(cfg["bl_hours"]))
+                                 bl_hours=int(cfg["bl_hours"]), no_auth=cfg["no_auth"], tx_power=int(cfg["tx_power"]),
+                                 ps_mode=int(cfg["ps_mode"]), cpu_mhz=int(cfg["cpu_mhz"]), up_mode=int(cfg["up_mode"]),
+                                 up_timeout=int(cfg["up_timeout"]))
         tmp = tempfile.mkdtemp(prefix="c3hole_")
         cfg_path = os.path.join(tmp, "cfg.bin")
         with open(cfg_path, "wb") as f:
@@ -302,7 +327,7 @@ def flash_job(cfg, q, stop):
         result["ip"] = ip
         prog(97)
         if ip:
-            result["login"] = check_login(ip, cfg["dash_pass"])
+            result["login"] = check_login(ip, None if cfg["no_auth"] else cfg["dash_pass"])
         prog(100)
         q.put(("done", result))
     except Exception as e:
@@ -332,6 +357,8 @@ def selftest():
             check("blocklist header", f.read(4) == b"C3HL")
         blob = cfgblob.build_cfg("Net", "password1", "Dash-pass-1")
         check("cfg blob", len(blob) == 4096 and blob.startswith(b"C3CFG1\n"))
+        blob = cfgblob.build_cfg("Net", "", "", no_auth=True)
+        check("cfg blob (no password)", b"noauth=1" in blob and b"dhash=\n" in blob)
         import esptool  # noqa: F401
         check("esptool import", True, esptool.__version__)
         check("serial ports api", isinstance(list_ports_info(), list))
@@ -358,127 +385,170 @@ def main_gui():
 
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("780x940")
-    root.minsize(720, 720)
+    root.resizable(False, False)   # window sizes itself to its content
     style = ttk.Style()
     try:
         style.theme_use("vista" if "vista" in style.theme_names() else "clam")
     except Exception:
         pass
-    style.configure("Big.TButton", font=("Segoe UI", 12, "bold"), padding=8)
-    style.configure("H.TLabel", font=("Segoe UI", 15, "bold"))
+    style.configure("Big.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 3))
+    style.configure("Small.TLabel", foreground="#666", font=("Segoe UI", 8))
 
     q = queue.Queue()
     stop = threading.Event()
     busy = {"v": False, "ports": []}
     saved = load_settings()
-
-    V = {k: tk.StringVar(value=saved.get(k, d)) for k, d in
-         (("ssid", ""), ("bl_url", ""), ("bl_hours", "24"), ("fw_url", ""), ("up1", "1.1.1.1"), ("up2", "9.9.9.9"),
-          ("bloom_kb", "128"))}
+    sv = lambda k, d: tk.StringVar(value=str(saved.get(k, d)))
+    V = {"ssid": sv("ssid", ""), "bl_url": sv("bl_url", ""), "bl_hours": sv("bl_hours", "24"), "fw_url": sv("fw_url", ""),
+         "up1": sv("up1", "8.8.8.8"), "up2": sv("up2", "9.9.9.9"), "bloom_kb": sv("bloom_kb", "128"),
+         "up_timeout": sv("up_timeout", "800")}
     v_wpass, v_dpass = tk.StringVar(), tk.StringVar()
-    v_show, v_adv = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
-    v_blmode, v_blpath = tk.StringVar(value="bundled"), tk.StringVar()
-    v_port, v_erase, v_baud = tk.StringVar(), tk.BooleanVar(value=True), tk.StringVar(value="460800")
+    v_noauth, v_erase = tk.BooleanVar(value=False), tk.BooleanVar(value=True)
+    v_bl, v_blpath = tk.StringVar(value="Bundled list"), tk.StringVar()
+    v_port, v_baud, v_log = tk.StringVar(), tk.StringVar(value="460800"), tk.BooleanVar(value=False)
+    tx_labels = ["%s" % lab for _, lab in sorted(cfgblob.TX_POWERS.items())]
+    tx_by_label = {lab: val for val, lab in cfgblob.TX_POWERS.items()}
+    v_tx = tk.StringVar(value=cfgblob.TX_POWERS.get(int(saved.get("tx_power", 44)), "11 dBm"))
+    ps_opts = ["Off (fastest)", "Minimum sleep", "Maximum sleep"]
+    v_ps = tk.StringVar(value=ps_opts[int(saved.get("ps_mode", 0))])
+    v_cpu = tk.StringVar(value="%s MHz" % saved.get("cpu_mhz", 160))
+    mode_opts = ["Primary, then 2nd", "Ask both at once"]
+    v_mode = tk.StringVar(value=mode_opts[int(saved.get("up_mode", 0))])
+    v_preset = tk.StringVar()
 
-    outer = ttk.Frame(root, padding=14)
+    outer = ttk.Frame(root, padding=(10, 8))
     outer.pack(fill="both", expand=True)
-    ttk.Label(outer, text="C3Hole - DNS ad-blocker flasher", style="H.TLabel").pack(anchor="w")
     if man:
-        info = "Bundled: %s domains | firmware v%s | built %s" % (format(man["blocklist_domains"], ","), man.get("version", "?"), man["built_at"])
+        info = "%s domains bundled  |  firmware v%s  |  %s" % (format(man["blocklist_domains"], ","), man.get("version", "?"), man["built_at"])
     else:
-        info = "WARNING: bundled assets not found (run the .exe built by the workflow)"
-    ttk.Label(outer, text=info, foreground="#555").pack(anchor="w", pady=(0, 6))
+        info = "WARNING: bundled assets not found - use the .exe built by the workflow"
+    ttk.Label(outer, text=info, style="Small.TLabel").pack(anchor="w")
 
-    def entry(parent, label, var, row, show=None, width=40):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3, padx=(0, 10))
-        e = ttk.Entry(parent, textvariable=var, width=width, show=show or "")
-        e.grid(row=row, column=1, sticky="we", pady=3)
-        return e
+    nb = ttk.Notebook(outer)
+    nb.pack(fill="x", pady=(4, 6))
+    t1, t2 = ttk.Frame(nb, padding=8), ttk.Frame(nb, padding=8)
+    nb.add(t1, text=" Setup ")
+    nb.add(t2, text=" Advanced ")
 
-    f1 = ttk.LabelFrame(outer, text=" 1. Wi-Fi (2.4 GHz) ", padding=8)
-    f1.pack(fill="x", pady=3)
-    f1.columnconfigure(1, weight=1)
-    entry(f1, "Network name (SSID)", V["ssid"], 0)
-    e_w = entry(f1, "Wi-Fi password", v_wpass, 1, show="*")
+    def lab(parent, text, r, c=0):
+        ttk.Label(parent, text=text).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=2)
 
-    f2 = ttk.LabelFrame(outer, text=" 2. Dashboard password ", padding=8)
-    f2.pack(fill="x", pady=3)
-    f2.columnconfigure(1, weight=1)
-    e_d = entry(f2, "Password (8+ chars)", v_dpass, 0, show="*")
-    ttk.Label(f2, text="Leave blank and a strong password is generated for you and shown after flashing.",
-              foreground="#555").grid(row=1, column=0, columnspan=2, sticky="w")
-    ttk.Checkbutton(outer, text="Show passwords", variable=v_show,
-                    command=lambda: [w.config(show="" if v_show.get() else "*") for w in (e_w, e_d)]).pack(anchor="w")
+    # ---- Setup tab
+    t1.columnconfigure(1, weight=1)
+    lab(t1, "Wi-Fi name", 0)
+    ttk.Entry(t1, textvariable=V["ssid"]).grid(row=0, column=1, columnspan=2, sticky="we", pady=2)
+    lab(t1, "Wi-Fi password", 1)
+    e_w = ttk.Entry(t1, textvariable=v_wpass, show="*")
+    e_w.grid(row=1, column=1, sticky="we", pady=2)
+    show = tk.BooleanVar(value=False)
+    ttk.Checkbutton(t1, text="show", variable=show, command=lambda: [w.config(show="" if show.get() else "*") for w in (e_w, e_d)]).grid(row=1, column=2, padx=(6, 0))
+    lab(t1, "Dashboard password", 2)
+    e_d = ttk.Entry(t1, textvariable=v_dpass, show="*")
+    e_d.grid(row=2, column=1, sticky="we", pady=2)
 
-    f3 = ttk.LabelFrame(outer, text=" 3. Blocklist ", padding=8)
-    f3.pack(fill="x", pady=3)
-    f3.columnconfigure(1, weight=1)
-    ttk.Radiobutton(f3, text="Bundled list (StevenBlack + Hagezi Multi PRO)", variable=v_blmode, value="bundled").grid(row=0, column=0, columnspan=3, sticky="w")
-    ttk.Radiobutton(f3, text="My own blocklist.bin:", variable=v_blmode, value="custom").grid(row=1, column=0, sticky="w")
-    ttk.Entry(f3, textvariable=v_blpath).grid(row=1, column=1, sticky="we", padx=6)
+    def on_noauth():
+        e_d.config(state="disabled" if v_noauth.get() else "normal")
+    ttk.Checkbutton(t1, text="none", variable=v_noauth, command=on_noauth).grid(row=2, column=2, padx=(6, 0))
+    ttk.Label(t1, text="Blank = a strong password is generated and shown after flashing. 'none' = open dashboard.", style="Small.TLabel", wraplength=470, justify="left").grid(row=3, column=0, columnspan=3, sticky="w")
+    lab(t1, "Blocklist", 4)
+    cbl = ttk.Combobox(t1, textvariable=v_bl, state="readonly", values=["Bundled list", "My own file..."])
+    cbl.grid(row=4, column=1, columnspan=2, sticky="we", pady=2)
 
-    def browse():
-        p = filedialog.askopenfilename(filetypes=[("Blocklist", "*.bin"), ("All", "*.*")])
-        if p:
-            v_blpath.set(p)
-            v_blmode.set("custom")
-    ttk.Button(f3, text="Browse...", command=browse).grid(row=1, column=2)
-    ttk.Label(f3, text="Auto-update URL").grid(row=2, column=0, sticky="w", pady=(6, 0))
-    ttk.Entry(f3, textvariable=V["bl_url"]).grid(row=2, column=1, columnspan=2, sticky="we", padx=6, pady=(6, 0))
-    ttk.Label(f3, text="Check every (hours, 0 = off)").grid(row=3, column=0, sticky="w")
-    ttk.Entry(f3, textvariable=V["bl_hours"], width=8).grid(row=3, column=1, sticky="w", padx=6)
+    def on_bl(_=None):
+        if v_bl.get() == "My own file...":
+            p = filedialog.askopenfilename(filetypes=[("Blocklist", "*.bin"), ("All", "*.*")])
+            if p:
+                v_blpath.set(p)
+                v_bl.set("File: " + os.path.basename(p))
+                cbl["values"] = ["Bundled list", "My own file...", v_bl.get()]
+            else:
+                v_bl.set("Bundled list")
+        elif v_bl.get() == "Bundled list":
+            v_blpath.set("")
+    cbl.bind("<<ComboboxSelected>>", on_bl)
+    lab(t1, "Auto-update URL", 5)
+    ttk.Entry(t1, textvariable=V["bl_url"]).grid(row=5, column=1, sticky="we", pady=2)
+    hf = ttk.Frame(t1)
+    hf.grid(row=5, column=2, padx=(6, 0))
+    ttk.Entry(hf, textvariable=V["bl_hours"], width=4).pack(side="left")
+    ttk.Label(hf, text=" h").pack(side="left")
 
-    ttk.Checkbutton(outer, text="Show advanced settings", variable=v_adv,
-                    command=lambda: fadv.pack(fill="x", pady=3, after=advmark) if v_adv.get() else fadv.pack_forget()).pack(anchor="w")
-    advmark = ttk.Frame(outer)
-    advmark.pack()
-    fadv = ttk.LabelFrame(outer, text=" Advanced ", padding=8)
-    fadv.columnconfigure(1, weight=1)
-    entry(fadv, "Upstream DNS 1", V["up1"], 0, width=20)
-    entry(fadv, "Upstream DNS 2 (optional)", V["up2"], 1, width=20)
-    entry(fadv, "Bloom filter KB (0 = auto)", V["bloom_kb"], 2, width=10)
-    entry(fadv, "Firmware update URL", V["fw_url"], 3)
+    # ---- Advanced tab
+    for c in (1, 3):
+        t2.columnconfigure(c, weight=1)
 
-    f4 = ttk.LabelFrame(outer, text=" 4. Board ", padding=8)
-    f4.pack(fill="x", pady=3)
-    f4.columnconfigure(1, weight=1)
-    ttk.Label(f4, text="COM port").grid(row=0, column=0, sticky="w", padx=(0, 10))
-    cb = ttk.Combobox(f4, textvariable=v_port, state="readonly", width=50)
-    cb.grid(row=0, column=1, sticky="we")
-    ttk.Checkbutton(f4, text="Erase all flash first (recommended)", variable=v_erase).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-    rb = ttk.Frame(f4)
-    rb.grid(row=2, column=0, columnspan=2, sticky="w")
-    ttk.Label(rb, text="Speed").pack(side="left")
-    ttk.Combobox(rb, textvariable=v_baud, values=["115200", "230400", "460800", "921600"], width=8, state="readonly").pack(side="left", padx=6)
-    ttk.Label(f4, text="Use a data-capable USB cable. If the board is not found or cannot connect: hold BOOT, tap RESET, release BOOT.",
-              foreground="#555", wraplength=680).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    def pair(r, c, text, widget):
+        lab(t2, text, r, c)
+        widget.grid(row=r, column=c + 1, sticky="we", pady=2, padx=(0, 8))
+    cpre = ttk.Combobox(t2, textvariable=v_preset, state="readonly", values=[p[0] for p in PRESETS], width=17)
+    pair(0, 0, "Upstream DNS", cpre)
+    pair(0, 2, "Mode", ttk.Combobox(t2, textvariable=v_mode, state="readonly", values=mode_opts, width=17))
+    e_u1 = ttk.Entry(t2, textvariable=V["up1"], width=14)
+    e_u2 = ttk.Entry(t2, textvariable=V["up2"], width=14)
+    pair(1, 0, "Server 1", e_u1)
+    pair(1, 2, "Server 2", e_u2)
+    ttk.Label(t2, text="IPv4, optional :port - e.g. 192.168.0.5:5353 for your own resolver", style="Small.TLabel", wraplength=470, justify="left").grid(row=2, column=0, columnspan=4, sticky="w")
 
-    btn = ttk.Button(outer, text="FLASH", style="Big.TButton")
-    btn.pack(fill="x", pady=(8, 4))
+    def on_preset(_=None):
+        for name, a, b in PRESETS:
+            if name == v_preset.get() and a:
+                V["up1"].set(a)
+                V["up2"].set(b)
+    cpre.bind("<<ComboboxSelected>>", on_preset)
+
+    def sync_preset(*_):
+        for name, a, b in PRESETS:
+            if a and a == V["up1"].get() and b == V["up2"].get():
+                v_preset.set(name)
+                return
+        v_preset.set("My own server...")
+    V["up1"].trace_add("write", sync_preset)
+    V["up2"].trace_add("write", sync_preset)
+    sync_preset()
+    pair(3, 0, "Failover ms", ttk.Entry(t2, textvariable=V["up_timeout"], width=8))
+    pair(3, 2, "Bloom KB (0=auto)", ttk.Entry(t2, textvariable=V["bloom_kb"], width=8))
+    pair(4, 0, "Wi-Fi TX power", ttk.Combobox(t2, textvariable=v_tx, state="readonly", values=tx_labels, width=10))
+    pair(4, 2, "Wi-Fi power save", ttk.Combobox(t2, textvariable=v_ps, state="readonly", values=ps_opts, width=17))
+    pair(5, 0, "CPU speed", ttk.Combobox(t2, textvariable=v_cpu, state="readonly", values=["160 MHz", "80 MHz"], width=10))
+    pair(5, 2, "Flash speed", ttk.Combobox(t2, textvariable=v_baud, state="readonly", values=["115200", "230400", "460800", "921600"], width=10))
+    lab(t2, "Firmware URL", 6)
+    ttk.Entry(t2, textvariable=V["fw_url"]).grid(row=6, column=1, columnspan=3, sticky="we", pady=2)
+    ttk.Checkbutton(t2, text="Erase all flash first (recommended)", variable=v_erase).grid(row=7, column=0, columnspan=4, sticky="w")
+    ttk.Label(t2, text="Cooler/more stable Wi-Fi: lower TX power (try 8.5 dBm), 80 MHz CPU, power save on.", style="Small.TLabel", wraplength=470, justify="left").grid(row=8, column=0, columnspan=4, sticky="w")
+
+    # ---- bottom bar
+    bar = ttk.Frame(outer)
+    bar.pack(fill="x")
+    bar.columnconfigure(0, weight=1)
+    cb = ttk.Combobox(bar, textvariable=v_port, state="readonly")
+    cb.grid(row=0, column=0, sticky="we", padx=(0, 8))
+    btn = ttk.Button(bar, text="FLASH", style="Big.TButton")
+    btn.grid(row=0, column=1)
     pb = ttk.Progressbar(outer, maximum=100)
-    pb.pack(fill="x")
-    status = tk.StringVar(value="Ready.")
-    ttk.Label(outer, textvariable=status).pack(anchor="w", pady=(2, 2))
-
-    res = ttk.LabelFrame(outer, text=" Result ", padding=8)
-    res.pack(fill="x", pady=3)
-    v_res = tk.StringVar(value="Dashboard details will appear here after flashing.")
-    ttk.Label(res, textvariable=v_res, wraplength=700, justify="left").pack(anchor="w")
-    rbtn = ttk.Frame(res)
-    rbtn.pack(anchor="w", pady=(4, 0))
-    b_open = ttk.Button(rbtn, text="Open dashboard", state="disabled")
+    pb.pack(fill="x", pady=(6, 2))
+    status = tk.StringVar(value="Plug in the board, then click FLASH. (Stuck? hold BOOT, tap RESET, release BOOT.)")
+    ttk.Label(outer, textvariable=status, style="Small.TLabel", wraplength=510).pack(anchor="w")
+    v_res = tk.StringVar(value="")
+    ttk.Label(outer, textvariable=v_res, wraplength=510, justify="left").pack(anchor="w", pady=(2, 0))
+    rb = ttk.Frame(outer)
+    rb.pack(anchor="w", pady=(2, 0))
+    b_open = ttk.Button(rb, text="Open dashboard", state="disabled")
     b_open.pack(side="left")
-    b_copy = ttk.Button(rbtn, text="Copy password", state="disabled")
+    b_copy = ttk.Button(rb, text="Copy password", state="disabled")
     b_copy.pack(side="left", padx=6)
-
     logf = ttk.Frame(outer)
-    logf.pack(fill="both", expand=True, pady=(4, 0))
-    logt = tk.Text(logf, height=6, wrap="word", font=("Consolas", 9), state="disabled", background="#111", foreground="#ddd")
+    logt = tk.Text(logf, height=7, wrap="word", font=("Consolas", 8), state="disabled", background="#111", foreground="#ddd")
     sb = ttk.Scrollbar(logf, command=logt.yview)
     logt.config(yscrollcommand=sb.set)
     sb.pack(side="right", fill="y")
     logt.pack(side="left", fill="both", expand=True)
+
+    def toggle_log():
+        if v_log.get():
+            logf.pack(fill="both", expand=True, pady=(4, 0))
+        else:
+            logf.pack_forget()
+    ttk.Checkbutton(rb, text="Show details", variable=v_log, command=toggle_log).pack(side="left", padx=10)
 
     def log(s):
         logt.config(state="normal")
@@ -492,15 +562,15 @@ def main_gui():
         ports = list_ports_info()
         if ports != busy["ports"]:
             busy["ports"] = ports
-            labels = [lab for _, lab in ports]
+            labels = [lab_ for _, lab_ in ports]
             cb["values"] = labels
             if v_port.get() not in labels:
                 v_port.set(labels[0] if labels else "")
         root.after(2000, refresh_ports)
 
     def selected_port():
-        for dev, lab in busy["ports"]:
-            if lab == v_port.get():
+        for dev, lab_ in busy["ports"]:
+            if lab_ == v_port.get():
                 return dev
         return None
 
@@ -508,18 +578,19 @@ def main_gui():
         d = {k: V[k].get().strip() for k in V}
         d["wifi_pass"] = v_wpass.get()
         d["dash_pass"] = v_dpass.get()
+        d["no_auth"] = v_noauth.get()
         return d
 
     def set_busy(b):
         busy["v"] = b
-        btn.config(state="disabled" if b else "normal", text="Flashing... do not unplug" if b else "FLASH")
+        btn.config(state="disabled" if b else "normal", text="Flashing..." if b else "FLASH")
         if not b:
             refresh_ports()
 
     def start():
         d = form()
         limit = man["blocklist_size"] if man else 0
-        err = validate(d, limit, v_blpath.get() if v_blmode.get() == "custom" else None)
+        err = validate(d, limit, v_blpath.get() or None)
         if not err and not selected_port():
             err = "No board found. Plug in the ESP32-C3 (use a data cable)."
         if not err and not man:
@@ -527,22 +598,28 @@ def main_gui():
         if err:
             messagebox.showwarning(APP_NAME, err)
             return
+        if d["no_auth"] and not messagebox.askyesno(APP_NAME, "No dashboard password: anyone on your network can open the dashboard, "
+                                                    "change settings and install firmware.\n\nContinue without a password?"):
+            return
         generated = False
-        if not d["dash_pass"]:
+        if not d["no_auth"] and not d["dash_pass"]:
             d["dash_pass"] = cfgblob.random_password(12)
             generated = True
         if v_erase.get() and not messagebox.askyesno(APP_NAME, "This erases everything on the board and installs C3Hole.\n\nContinue?"):
             return
-        save_settings({k: d[k] for k in ("ssid", "bl_url", "bl_hours", "fw_url", "up1", "up2", "bloom_kb")})
+        d.update(tx_power=tx_by_label[v_tx.get()], ps_mode=ps_opts.index(v_ps.get()), cpu_mhz=int(v_cpu.get().split()[0]),
+                 up_mode=mode_opts.index(v_mode.get()))
+        save_settings({k: d[k] for k in ("ssid", "bl_url", "bl_hours", "fw_url", "up1", "up2", "bloom_kb", "up_timeout",
+                                         "tx_power", "ps_mode", "cpu_mhz", "up_mode")})
         d.update(port=selected_port(), baud=int(v_baud.get()), erase=v_erase.get(), generated=generated,
-                 blocklist_path=v_blpath.get() if v_blmode.get() == "custom" else None)
+                 blocklist_path=v_blpath.get() or None)
         stop.clear()
         pb["value"] = 0
-        v_res.set("Working...")
+        v_res.set("")
         b_open.config(state="disabled")
         b_copy.config(state="disabled")
         set_busy(True)
-        status.set("Flashing...")
+        status.set("Flashing - do not unplug...")
         threading.Thread(target=flash_job, args=(d, q, stop), daemon=True).start()
 
     btn.config(command=start)
@@ -554,32 +631,33 @@ def main_gui():
         lines = []
         if ip:
             url = "http://%s" % ip
-            lines.append("Dashboard: %s   (also http://c3hole.local)" % url)
+            lines.append("Dashboard: %s  (or http://c3hole.local)" % url)
             b_open.config(state="normal", command=lambda: webbrowser.open(url))
         else:
-            lines.append("Flashed OK, but the device did not report an IP within 60 s. Check the Wi-Fi name/password and press RESET. "
-                         "If it cannot join, it keeps retrying; hold BOOT for 5 s to wipe settings and use the 'C3Hole-Setup' Wi-Fi.")
-        lines.append("Username: admin     Password: %s%s" % (pw, "   (generated for you - save it now)" if r["generated"] else ""))
-        if login is True:
-            lines.append("Login check: password accepted by the device.")
+            lines.append("Flashed, but no IP reported within 60 s. Check the Wi-Fi name/password and press RESET; "
+                         "hold BOOT 5 s to wipe settings and use the 'C3Hole-Setup' Wi-Fi.")
+        if r["no_auth"]:
+            lines.append("No password: the dashboard is open to your network.")
+        else:
+            lines.append("User: admin   Password: %s%s" % (pw, "  (generated - save it now)" if r["generated"] else ""))
+        if login is True and not r["no_auth"]:
+            lines.append("Login check passed.")
         elif login is False:
-            lines.append("Login check: the device rejected the password - please report this.")
-        elif ip:
-            lines.append("Login check: dashboard not reachable from this PC yet (try the link above).")
-        lines.append("Next: set your router's DNS to the device IP and give it a DHCP reservation.")
+            lines.append("Login check FAILED - the device rejected the password.")
+        lines.append("Next: set your router's DNS to this IP and reserve it in DHCP.")
         v_res.set("\n".join(lines))
-
-        def cp():
-            root.clipboard_clear()
-            root.clipboard_append(pw)
-        b_copy.config(state="normal", command=cp)
+        if pw:
+            def cp():
+                root.clipboard_clear()
+                root.clipboard_append(pw)
+            b_copy.config(state="normal", command=cp)
 
     def show_error(msg):
         set_busy(False)
         status.set("Failed.")
         hint = ""
         if re.search(r"Failed to connect|No serial data|Could not open|PermissionError|timed out", msg, re.I):
-            hint = "\n\nTry: another USB cable/port, close any serial monitor, then hold BOOT, tap RESET, release BOOT and click FLASH again."
+            hint = "\n\nTry another USB cable/port, close any serial monitor, then hold BOOT, tap RESET, release BOOT and click FLASH again."
         v_res.set("Flashing failed: " + msg + hint)
         messagebox.showerror(APP_NAME, "Flashing failed:\n\n" + msg + hint)
 

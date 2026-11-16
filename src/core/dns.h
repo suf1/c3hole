@@ -43,12 +43,15 @@ class DnsServer {
   DnsServer(Matcher& matcher, uint32_t (*rng)());
   ~DnsServer();
 
-  // Upstream addresses are IPv4 in network byte order (0 = unused).
+  // Upstream addresses are IPv4 in network byte order (0 = unused); ports are in host byte order.
   bool begin(uint16_t port, uint32_t up1, uint32_t up2);
   void end();
   void setUpstreams(uint32_t up1, uint32_t up2);
+  void setUpstreamEndpoints(uint32_t ip1, uint16_t port1, uint32_t ip2, uint16_t port2);
+  // false: ask the primary, retry on the secondary after the timeout. true: ask both at once, first answer wins.
+  void setParallel(bool on) { parallel_ = on; }
   void setTimeoutMs(uint32_t ms) { timeoutMs_ = ms; }
-  void setUpstreamPort(uint16_t port) { upPort_ = port; }  // default 53 (tests use another)
+  void setUpstreamPort(uint16_t port) { up1Port_ = up2Port_ = port; }  // both upstreams (default 53)
 
   // Runs one iteration: waits up to waitMs for traffic, handles it, expires timeouts.
   void step(int waitMs);
@@ -84,7 +87,8 @@ class DnsServer {
   uint32_t (*rng_)();
   int srv_, up_;
   uint32_t up1_, up2_, timeoutMs_;
-  uint16_t upPort_;
+  uint16_t up1Port_, up2Port_;
+  bool parallel_;
   Slot slots_[kSlots];
   DnsStats st_;
   bool lastRead_;

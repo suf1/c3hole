@@ -11,7 +11,8 @@ button{background:#1f6feb;color:#fff;border:0;border-radius:6px}small{color:#666
 <form method=post action=/setup>
 <input name=ssid placeholder="Wi-Fi name (SSID)" required maxlength=32>
 <input name=wpass type=password placeholder="Wi-Fi password" maxlength=63>
-<input name=dpass type=password placeholder="Dashboard password (8+ chars)" required minlength=8 maxlength=60>
+<input name=dpass type=password placeholder="Dashboard password (8+ chars)" maxlength=60>
+<label><input type=checkbox name=nopw value=1 style="width:auto"> No password (anyone on my network can open the dashboard)</label>
 <button>Save and restart</button></form></body></html>)HTML";
 
 static const char DASH_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8>
@@ -48,6 +49,12 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <div class=row><span>Free heap (min)</span><b id=heap>-</b></div><div class=row><span>Uptime</span><b id=up>-</b></div>
 <div class=row><span>Wi-Fi</span><b id=wifi>-</b></div></div>
 
+<div class=card><h2>System health</h2>
+<div class=row><span>Chip temperature</span><b id=temp>-</b></div><div class=row><span>CPU</span><b id=cpu>-</b></div>
+<div class=row><span>Last restart reason</span><b id=reset>-</b></div><div class=row><span>Wi-Fi drops (last reason)</span><b id=drops>-</b></div>
+<div class=row><span>Largest free block</span><b id=maxblk>-</b></div><div class=row><span>Low-memory events</span><b id=lowheap>-</b></div>
+<small>If the dashboard ever disappears, these show why after it comes back (power, crash, Wi-Fi or memory).</small></div>
+
 <div class=card><h2>Recently blocked</h2><ul id=recent></ul></div>
 <div class=card><h2>Clients</h2><ul id=clients></ul></div>
 
@@ -63,13 +70,30 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <label>Blocklist URL (https or http)</label><input id=blurl placeholder="https://.../blocklist.bin">
 <label>Auto-update every (hours, 0 = off)</label><input id=blhours type=number min=0 max=8760>
 <label>Firmware URL</label><input id=fwurl placeholder="https://.../firmware.bin">
-<label>Upstream DNS 1 / 2</label><input id=up1><input id=up2>
+<label>Upstream DNS provider</label><select id=preset onchange=preset()>
+<option value=custom>Custom / my own server</option><option value=g>Google 8.8.8.8</option><option value=q9>Quad9 9.9.9.9</option>
+<option value=cf>Cloudflare 1.1.1.1</option><option value=ag>AdGuard 94.140.14.14</option><option value=od>OpenDNS 208.67.222.222</option></select>
+<label>Upstream 1 / 2 <small>(IPv4, optional :port - e.g. 192.168.0.5:5353 for your own resolver)</small></label>
+<input id=up1 oninput="$('preset').value='custom'"><input id=up2 oninput="$('preset').value='custom'" placeholder="optional">
+<label>When asking upstream</label><select id=upmode><option value=0>Primary first, secondary if no answer</option><option value=1>Ask both, use the first answer</option></select>
+<label>Failover timeout (ms)</label><input id=uptmo type=number min=100 max=5000>
 <label>Bloom filter KB (0 = automatic, applied immediately)</label><input id=bloomkb type=number min=0 max=400>
 <button onclick=saveCfg()>Save settings</button></div>
 
+<div class=card><h2>Radio &amp; cooling</h2>
+<label>Wi-Fi transmit power (lower = cooler, shorter range)</label><select id=txpower>
+<option value=8>2 dBm</option><option value=20>5 dBm</option><option value=28>7 dBm</option><option value=34>8.5 dBm</option><option value=44>11 dBm</option>
+<option value=52>13 dBm</option><option value=60>15 dBm</option><option value=68>17 dBm</option><option value=74>18.5 dBm</option><option value=76>19 dBm</option><option value=78>19.5 dBm</option></select>
+<label>Wi-Fi power save (cooler, slightly slower replies)</label><select id=ps><option value=0>Off - fastest</option><option value=1>Minimum modem sleep</option><option value=2>Maximum modem sleep</option></select>
+<label>CPU speed (80 MHz runs cooler; applies after reboot)</label><select id=cpu><option value=160>160 MHz</option><option value=80>80 MHz</option></select>
+<button onclick=saveCfg()>Save radio settings</button>
+<small>If the chip runs hot or Wi-Fi keeps dropping, try 8.5 dBm first.</small></div>
+
 <div class=card><h2>Security &amp; device</h2>
+<div class=row><span>Dashboard password</span><b id=authst>-</b></div>
 <label>New dashboard password (8+ chars)</label><input id=newpw type=password autocomplete=new-password>
-<button onclick=chpw()>Change password</button>
+<button onclick=chpw()>Set password</button>
+<button class=sec onclick=nopw()>Remove password (open dashboard)</button>
 <label>Wi-Fi network / password</label><input id=wssid placeholder=SSID><input id=wpass type=password placeholder="Wi-Fi password" autocomplete=new-password>
 <button class=sec onclick=chwifi()>Save Wi-Fi and reboot</button>
 <button class=sec onclick="if(confirm('Reboot now?'))act('/api/reboot','Rebooting...')">Reboot</button>
@@ -78,6 +102,8 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 </main>
 <script>
 const $=id=>document.getElementById(id);let filled=false;
+const PRESETS={g:['8.8.8.8','8.8.4.4'],q9:['9.9.9.9','149.112.112.112'],cf:['1.1.1.1','1.0.0.1'],ag:['94.140.14.14','94.140.15.15'],od:['208.67.222.222','208.67.220.220']};
+function preset(){const v=$('preset').value;if(PRESETS[v]){$('up1').value=PRESETS[v][0];$('up2').value=PRESETS[v][1]}}
 function msg(t,bad){const m=$('msg');m.textContent=t;m.className=bad?'bad':'ok'}
 async function api(p,o){o=o||{};o.headers=Object.assign({'X-C3H':'1'},o.headers||{});const r=await fetch(p,o);const t=await r.text();if(!r.ok)throw new Error(t||r.status);try{return JSON.parse(t)}catch(e){return {}}}
 async function act(p,m,body){try{msg(m);await api(p,{method:'POST',body:body});msg('Done.')}catch(e){msg(e.message,1)}}
@@ -97,14 +123,20 @@ $('bsz').textContent=b.on?(b.kb+' KB / k='+b.k):'off (low RAM)';$('bfp').textCon
 $('bnf').textContent=m.misses?(100*m.noflash/m.misses).toFixed(1)+'%':'-';$('bfs').textContent=fmt(m.searches);
 $('heap').textContent=Math.round(s.heap.free/1024)+' KB ('+Math.round(s.heap.min/1024)+' KB)';$('up').textContent=dur(s.uptime);
 $('wifi').textContent=s.wifi.ssid+' '+s.wifi.rssi+' dBm '+s.wifi.ip;
+const y=s.sys;$('temp').textContent=y.temp.toFixed(0)+' C';$('cpu').textContent=y.cpu+' MHz';$('reset').textContent=y.reset;
+$('drops').textContent=y.drops+(y.drops?' (reason '+y.disc+')':'');$('maxblk').textContent=Math.round(s.heap.maxblk/1024)+' KB';$('lowheap').textContent=y.lowheap;
+$('authst').textContent=s.cfg.noauth?'OFF - open to your network':'on';$('authst').className=s.cfg.noauth?'bad':'ok';
 list($('recent'),s.recent,x=>x);list($('clients'),s.clients,c=>c.ip+'  '+fmt(c.total)+' q, '+fmt(c.blocked)+' blocked');
 $('upb').hidden=!u.busy;$('upb').value=u.pct;$('upmsg').textContent=u.msg;
-if(!filled){const c=s.cfg;for(const k in c)if($(k))$(k).value=c[k];$('wssid').value=s.wifi.ssid;filled=true}
+if(!filled){const c=s.cfg;for(const k in c)if($(k)&&typeof c[k]!=='boolean')$(k).value=c[k];$('wssid').value=s.wifi.ssid;
+for(const k in PRESETS)if(PRESETS[k][0]==c.up1&&PRESETS[k][1]==c.up2)$('preset').value=k;filled=true}
 }catch(e){msg(e.message,1)}}
-async function saveCfg(){const p=new URLSearchParams();['blurl','blhours','fwurl','up1','up2','bloomkb'].forEach(k=>p.append(k,$(k).value));
+async function saveCfg(){const p=new URLSearchParams();['blurl','blhours','fwurl','up1','up2','bloomkb','txpower','ps','cpu','upmode','uptmo'].forEach(k=>p.append(k,$(k).value));
 await act('/api/config','Saving...',p)}
 async function chpw(){const v=$('newpw').value;if(v.length<8){msg('Password must be at least 8 characters',1);return}
 await act('/api/password','Saving...',new URLSearchParams({pw:v}));msg('Password changed. Your browser will ask for it again.')}
+async function nopw(){if(!confirm('Anyone on your network will be able to open this dashboard, change settings and install firmware. Remove the password?'))return;
+await act('/api/password','Saving...',new URLSearchParams({nopw:'1'}));filled=false}
 async function chwifi(){await act('/api/wifi','Saving...',new URLSearchParams({ssid:$('wssid').value,pass:$('wpass').value}))}
 function upload(id,url,isbl){const f=$(id).files[0];if(!f){msg('Choose a file first',1);return}
 const go=()=>{const x=new XMLHttpRequest();x.open('POST',url);x.setRequestHeader('X-C3H','1');
