@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -250,6 +251,7 @@ struct FakeUpstream {
   std::atomic<bool> stop;
   std::atomic<int> received;
   std::thread th;
+  std::function<void(std::vector<uint8_t>&)> mutate;   // lets a test shape the reply
   struct Item { uint64_t due; std::vector<uint8_t> pkt; sockaddr_in to; };
 
   FakeUpstream(const char* ip, uint16_t bindPort, int delay) : delayMs(delay), stop(false), received(0) {
@@ -277,6 +279,7 @@ struct FakeUpstream {
         if (q[i].due <= now) {
           q[i].pkt[2] |= 0x80;                       // QR=1  (echo as a "response")
           q[i].pkt[7] = 1;                           // pretend ANCOUNT=1 so tests can tell it came from here
+          if (mutate) mutate(q[i].pkt);
           sendto(fd, q[i].pkt.data(), q[i].pkt.size(), 0, (sockaddr*)&q[i].to, sizeof(q[i].to));
           q.erase(q.begin() + (long)i);
         } else i++;
@@ -490,6 +493,119 @@ static void testOwnUpstreamAndParallel() {
   }
 }
 
+static void appendName(std::vector<uint8_t>& v, const char* name) {
+  const char* s = name;
+  while (*s) {
+    const char* dot = strchr(s, '.');
+    size_t l = dot ? (size_t)(dot - s) : strlen(s);
+    v.push_back((uint8_t)l);
+    v.insert(v.end(), s, s + l);
+    s += l; if (*s == '.') s++;
+  }
+  v.push_back(0);
+}
+
+// Appends "<ptr to question name> CNAME <target>" (target given as literal labels, optionally + a pointer) and an A record.
+static void addCname(std::vector<uint8_t>& p, const char* targetLabels, bool tailPointer) {
+  p[7] = 2;
+  p.push_back(0xC0); p.push_back(0x0C);
+  p.push_back(0); p.push_back(5); p.push_back(0); p.push_back(1);
+  p.push_back(0); p.push_back(0); p.push_back(0); p.push_back(60);
+  std::vector<uint8_t> rd;
+  if (tailPointer) {                                    // labels then a pointer to the question name
+    const char* s = targetLabels;
+    while (*s) { const char* dot = strchr(s, '.'); size_t l = dot ? (size_t)(dot - s) : strlen(s); rd.push_back((uint8_t)l); rd.insert(rd.end(), s, s + l); s += l; if (*s == '.') s++; }
+    rd.push_back(0xC0); rd.push_back(0x0C);
+  } else {
+    appendName(rd, targetLabels);
+  }
+  p.push_back((uint8_t)(rd.size() >> 8)); p.push_back((uint8_t)rd.size());
+  p.insert(p.end(), rd.begin(), rd.end());
+  p.push_back(0xC0); p.push_back(0x0C);                 // A record for the same owner
+  p.push_back(0); p.push_back(1); p.push_back(0); p.push_back(1);
+  p.push_back(0); p.push_back(0); p.push_back(0); p.push_back(60);
+  p.push_back(0); p.push_back(4); p.push_back(1); p.push_back(2); p.push_back(3); p.push_back(4);
+}
+
+static void testCnameCanaryTruncation() {
+  printf("[dns server: CNAME uncloaking, DoH canary, truncation counter]\n");
+  uint8_t q[512], r[1500];
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) { addCname(p, "t.ads.tracker.io", false); };   // cloaked: target is blocked
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    c.send(q, buildQuery(q, 0x9001, "x.cloaked.test", 1, false));
+    int rn = c.recv(r, sizeof(r), 800);
+    CHECK(rn > 12 && r[0] == 0x90 && r[1] == 0x01, "reply received with the client's ID");
+    CHECK(rn > 4 && r[7] == 1 && memcmp(r + rn - 4, "\0\0\0\0", 4) == 0, "cloaked name answered 0.0.0.0, upstream answer discarded");
+    DnsStats st = sr.srv.stats();
+    CHECK(st.cnameBlocked == 1 && st.blocked == 1 && st.answered == 1 && sr.srv.pending() == 0, "cnameBlocked=%u blocked=%u answered=%u", st.cnameBlocked, st.blocked, st.answered);
+    ClientStat cs[2];
+    CHECK(sr.srv.clients(cs, 2) == 1 && cs[0].blocked == 1, "client blocked counter updated");
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) { addCname(p, "edge", true); };                 // harmless target, compressed name
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    c.send(q, buildQuery(q, 0x9002, "x.cloaked.test", 1, false));
+    int rn = c.recv(r, sizeof(r), 800);
+    CHECK(rn > 12 && r[0] == 0x90 && r[1] == 0x02 && r[7] == 2, "harmless CNAME passes through untouched (2 answers)");
+    CHECK(sr.srv.stats().cnameBlocked == 0, "no false CNAME block");
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) {                                               // pointer loop in the answer name
+      p[7] = 1;
+      size_t at = p.size();
+      p.push_back(0xC0); p.push_back((uint8_t)at);                                        // points at itself
+      const uint8_t rest[] = {0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xC0, 0x0C};
+      p.insert(p.end(), rest, rest + sizeof(rest));
+    };
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    c.send(q, buildQuery(q, 0x9003, "loop.test", 1, false));
+    CHECK(c.recv(r, sizeof(r), 800) > 12 && sr.srv.stats().cnameBlocked == 0, "pointer loop is survived and forwarded");
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    c.send(q, buildQuery(q, 0x9004, "Use-Application-DNS.net", 1, false));
+    int rn = c.recv(r, sizeof(r), 500);
+    CHECK(rn >= 12 && r[0] == 0x90 && r[1] == 0x04 && (r[3] & 0x0F) == 3 && r[7] == 0, "canary name -> NXDOMAIN, no answers");
+    c.send(q, buildQuery(q, 0x9005, "mask.icloud.com", 28, false));
+    rn = c.recv(r, sizeof(r), 500);
+    CHECK(rn >= 12 && (r[3] & 0x0F) == 3, "iCloud Private Relay name -> NXDOMAIN");
+    CHECK(sr.srv.stats().canary == 2 && up.received == 0, "canary answered locally (canary=%u, upstream saw %d)", sr.srv.stats().canary, up.received.load());
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) { p[2] |= 0x02; };                              // TC bit
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    c.send(q, buildQuery(q, 0x9006, "big.answer.test", 1, false));
+    CHECK(c.recv(r, sizeof(r), 800) > 12 && sr.srv.stats().truncated == 1, "truncated replies are counted (%u)", sr.srv.stats().truncated);
+  }
+  {
+    // fuzz: random corruption and every truncation of a real reply must never crash or hang the parser
+    std::vector<uint8_t> base(q, q + buildQuery(q, 1, "x.cloaked.test", 1, false));
+    addCname(base, "t.ads.tracker.io", false);
+    base[2] |= 0x80;
+    CHECK(dnsCnameTargetBlocked(base.data(), base.size(), g_matcher), "fuzz baseline is detected");
+    for (size_t n = 0; n <= base.size(); n++) dnsCnameTargetBlocked(base.data(), n, g_matcher);
+    int detected = 0;
+    for (int i = 0; i < 20000; i++) {
+      std::vector<uint8_t> m = base;
+      int flips = 1 + (int)(rng32() % 6);
+      for (int k = 0; k < flips; k++) m[rng32() % m.size()] = (uint8_t)rng32();
+      detected += dnsCnameTargetBlocked(m.data(), m.size(), g_matcher) ? 1 : 0;
+    }
+    CHECK(detected > 0, "fuzz run completed (%d of 20000 mutants still detected)", detected);
+  }
+}
+
 int main() {
   testSha();
   testHash();
@@ -505,6 +621,7 @@ int main() {
   testServerBlocking();
   testServerRetryTimeoutOverflow();
   testOwnUpstreamAndParallel();
+  testCnameCanaryTruncation();
   printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail ? 1 : 0;
 }

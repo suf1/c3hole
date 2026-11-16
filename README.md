@@ -16,7 +16,7 @@ fits on a bare ESP32-C3 SuperMini.
 
 Domains block their subdomains automatically (`ads.example.com` is blocked when `example.com` is listed).
 
-## Measured on the host test suite (`sh tests/run_tests.sh`, 126 checks)
+## Measured on the host test suite (`sh tests/run_tests.sh`, 139 checks)
 
 * 253,000-domain list: every listed domain found, 0 false blocks in 200,000 random lookups.
 * Share of non-blocked lookups settled by the Bloom filter alone (0 flash reads) at 253K domains:
@@ -70,6 +70,35 @@ then **Update firmware from URL**) or by uploading `firmware.bin` in the dashboa
 Flash with the flasher .exe or `esptool` using the offsets above. Without the flasher the device
 starts a setup Wi-Fi `C3Hole-Setup` (http://192.168.4.1) where you enter your Wi-Fi and dashboard password.
 
+## Getting more blocked, and why ads sometimes still appear
+
+Blocked share is not a quality score (15-35 % is normal; it depends on what your devices do). What matters is ads that
+get through. The usual reasons, most likely first:
+
+1. **A device is not really using C3Hole.** The dashboard's *Clients* list shows every device that asked; a phone or PC
+   that is missing, or has tiny counts, is using another resolver. Typical culprits: a second DNS server in the router/DHCP
+   settings (devices switch to it when C3Hole is briefly unreachable and stay for minutes), browser "Secure DNS"/DoH,
+   Android "Private DNS", iCloud Private Relay, apps and TVs with built-in DNS, and an **IPv6 DNS server advertised by the
+   router** (C3Hole is IPv4-only; turn off IPv6 DNS advertisement or IPv6 in the router).
+2. **Cached answers.** `ipconfig /flushdns` and restart the browser after changing anything.
+3. **First-party ads.** YouTube video ads, sponsored posts in Facebook/Instagram feeds and similar come from the same
+   domains as the content. No DNS blocker can remove them.
+4. **CNAME cloaking** - a harmless-looking name that secretly points to a tracker. Handled: every upstream reply's CNAME
+   chain is checked against the list (*Cloaked trackers caught* on the dashboard).
+5. **Encrypted-DNS bypass.** C3Hole answers NXDOMAIN for `use-application-dns.net` (Firefox) and `mask.icloud.com` /
+   `mask-h2.icloud.com` (iCloud Private Relay), which is the standard signal to turn those features off on a network
+   (iOS will say Private Relay is unavailable here). Chrome/Edge "Secure DNS" and Android "Private DNS" must be switched off by hand.
+6. **The domain is not on the list.** Add your own in `custom/block.txt`, or add a bigger source in the workflow
+   (for example Hagezi `pro.plus`); the builder refuses a list larger than the device holds (301,456 domains).
+   More lists block more but also break more sites; keep `custom/allow.txt` for exceptions.
+7. **No TCP:53.** If an upstream reply is too big, a client retries over TCP and C3Hole does not answer it. The dashboard
+   counts these as *Truncated replies (need TCP)*; if that number grows, TCP support is worth adding.
+8. **Outages.** While the device is offline (see *Wi-Fi drops*), clients with another DNS server use it. Use only C3Hole
+   in DHCP, give it a DHCP reservation, and for redundancy run **two** C3Holes as primary and secondary DNS.
+
+Quick checks from a PC: `nslookup doubleclick.net <C3Hole IP>` must answer 0.0.0.0 every time, and
+`Get-DnsClientServerAddress` must list only the C3Hole address for IPv4 *and* IPv6.
+
 ## Upstream DNS (including your own server)
 
 Pick a provider preset or type any IPv4 address, optionally with a port: `192.168.0.5` or `192.168.0.5:5353`
@@ -122,13 +151,14 @@ Give the device a DHCP reservation in your router so its IP never changes.
 
 * DNS over UDP only (no TCP:53 fallback, no DoH/DoT). Clients that insist on DoH bypass any DNS blocker.
 * No DNS cache; every non-blocked query goes upstream.
+* No TCP:53 (see the truncated-replies counter).
 * Manual blocklist upload erases the old list first (a failed upload leaves the device with no list until retried);
   the HTTPS update path is safe because it verifies before erasing.
 * Not run on hardware by the author of this package: see "Verification status".
 
 ## Verification status
 
-Done: 126 automated host checks (hashing, Bloom, matcher, config, DNS packets, real UDP async tests,
+Done: 139 automated host checks (also run under AddressSanitizer/UBSan) (hashing, Bloom, matcher, config, DNS packets, real UDP async tests,
 Python-built lists/config read by the C++ code); full compile + link of the firmware with the real toolchain
 and SDK; partition table validated with Espressif's `gen_esp32part.py`; flasher logic, validation and GUI
 exercised with a simulated esptool.
@@ -144,6 +174,7 @@ the PlatformIO build itself, and building the Windows `.exe`. The workflow runs 
     src/web_ui.h         embedded dashboard
     tools/               blocklist builder, CA bundle tool, settings-blob writer
     flasher/             the Windows GUI flasher (Python/tkinter + esptool)
+    custom/              your own block.txt / allow.txt, merged into the weekly build
     ci/, .github/        build scripts and workflow
     tests/               host tests (`sh tests/run_tests.sh`)
 

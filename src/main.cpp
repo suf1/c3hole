@@ -579,7 +579,8 @@ static String statusJson() {
        WiFi.localIP().toString() + "\"}";
   j += ",\"dns\":{\"total\":" + String(d.total) + ",\"blocked\":" + String(d.blocked) + ",\"forwarded\":" + String(d.forwarded) +
        ",\"answered\":" + String(d.answered) + ",\"timeouts\":" + String(d.timeouts) + ",\"retried\":" + String(d.retried) +
-       ",\"overflow\":" + String(d.overflow) + ",\"pending\":" + String(dnsServer.pending()) + "}";
+       ",\"overflow\":" + String(d.overflow) + ",\"pending\":" + String(dnsServer.pending()) + ",\"cname\":" + String(d.cnameBlocked) +
+       ",\"trunc\":" + String(d.truncated) + ",\"canary\":" + String(d.canary) + "}";
   j += ",\"match\":{\"queries\":" + String(m.queries) + ",\"misses\":" + String(m.misses) + ",\"noflash\":" + String(m.missesNoFlash) +
        ",\"searches\":" + String(m.flashSearches) + "}";
   j += ",\"bloom\":{\"on\":" + String(matcher.hasBloom() ? "true" : "false") + ",\"kb\":" + String(matcher.bloomBytes() / 1024) +

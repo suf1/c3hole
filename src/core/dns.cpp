@@ -78,6 +78,81 @@ size_t dnsBuildBlockedReply(const uint8_t* query, size_t qlen, const DnsQuestion
   return pos;
 }
 
+// Decodes a (possibly compressed) name at `pos` into lower-case dotted text (out may be null).
+// Returns the offset just past the name as stored at `pos`, or 0 on any malformation.
+static size_t readName(const uint8_t* p, size_t len, size_t pos, char* out, size_t cap) {
+  size_t n = 0, end = 0;
+  int jumps = 0;
+  for (;;) {
+    if (pos >= len) return 0;
+    uint8_t l = p[pos];
+    if (l == 0) { if (!end) end = pos + 1; break; }
+    if ((l & 0xC0) == 0xC0) {
+      if (pos + 1 >= len) return 0;
+      if (!end) end = pos + 2;
+      if (++jumps > 8) return 0;                       // pointer loops
+      size_t ptr = ((size_t)(l & 0x3F) << 8) | p[pos + 1];
+      if (ptr >= len) return 0;
+      pos = ptr;
+      continue;
+    }
+    if (l & 0xC0) return 0;
+    if (pos + 1 + l > len) return 0;
+    if (out) {
+      if (n + l + 2 > cap) return 0;
+      if (n) out[n++] = '.';
+      for (uint8_t i = 0; i < l; i++) {
+        char c = (char)p[pos + 1 + i];
+        out[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+      }
+    }
+    pos += 1 + l;
+  }
+  if (out) out[n] = 0;
+  return end;
+}
+
+bool dnsCnameTargetBlocked(const uint8_t* p, size_t len, Matcher& m) {
+  if (len < 12 || (p[3] & 0x0F) != 0) return false;
+  uint16_t qd = be16(p + 4), an = be16(p + 6);
+  if (an == 0 || qd > 4) return false;
+  size_t pos = 12;
+  for (uint16_t i = 0; i < qd; i++) {
+    pos = readName(p, len, pos, nullptr, 0);
+    if (!pos || pos + 4 > len) return false;
+    pos += 4;
+  }
+  char name[254];
+  for (uint16_t i = 0; i < an && i < 24; i++) {
+    pos = readName(p, len, pos, nullptr, 0);
+    if (!pos || pos + 10 > len) return false;
+    uint16_t type = be16(p + pos), cls = be16(p + pos + 2), rdl = be16(p + pos + 8);
+    pos += 10;
+    if (pos + rdl > len) return false;
+    if (type == 5 && cls == 1 && readName(p, len, pos, name, sizeof(name)) && name[0] && m.isBlocked(name, strlen(name)))
+      return true;
+    pos += rdl;
+  }
+  return false;
+}
+
+bool dnsIsDohCanary(const char* name) {
+  return !strcmp(name, "use-application-dns.net") ||   // Firefox
+         !strcmp(name, "mask.icloud.com") ||           // Apple iCloud Private Relay
+         !strcmp(name, "mask-h2.icloud.com");
+}
+
+size_t dnsBuildNxdomain(const uint8_t* query, const DnsQuestion& q, uint8_t* out, size_t cap) {
+  if (cap < q.qend) return 0;
+  memcpy(out, query, q.qend);
+  out[2] = (uint8_t)(0x80 | (query[2] & 0x01));      // QR=1, keep RD
+  out[3] = 0x83;                                     // RA=1, RCODE=3 (NXDOMAIN)
+  putBe16(out + 6, 0);
+  putBe16(out + 8, 0);
+  putBe16(out + 10, 0);
+  return q.qend;
+}
+
 uint32_t DnsServer::nowMs() {
   return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -207,6 +282,12 @@ size_t DnsServer::recentBlocked(char out[][kRecentLen], size_t max) const {
   return n;
 }
 
+void DnsServer::markClientBlocked(uint32_t ip) {
+  std::lock_guard<std::mutex> g(mu_);
+  for (int i = 0; i < kClients; i++)
+    if (clients_[i].ip == ip) { clients_[i].blocked++; return; }
+}
+
 size_t DnsServer::clients(ClientStat* out, size_t max) const {
   std::lock_guard<std::mutex> g(mu_);
   size_t n = 0;
@@ -233,6 +314,20 @@ void DnsServer::onClient() {
     noteClient(ip, false);
     forward(buf_, (size_t)n, ip, port);
     return;
+  }
+  if (q.qclass == 1 && dnsIsDohCanary(q.name)) {     // tell browsers/OSes not to bypass us with encrypted DNS
+    size_t rn = dnsBuildNxdomain(buf_, q, out_, sizeof(out_));
+    if (rn) {
+      sockaddr_in to;
+      memset(&to, 0, sizeof(to));
+      to.sin_family = AF_INET;
+      to.sin_addr.s_addr = ip;
+      to.sin_port = port;
+      noteClient(ip, false);
+      st_.canary++;
+      sendto(srv_, out_, rn, 0, (sockaddr*)&to, sizeof(to));
+      return;
+    }
   }
   bool blocked = q.qclass == 1 && matcher_.isBlocked(q.name, q.nameLen);
   noteClient(ip, blocked);
@@ -301,6 +396,29 @@ void DnsServer::onUpstream() {
   uint16_t id = be16(buf_);
   Slot& s = slots_[id & (kSlots - 1)];
   if (!s.used || s.upId != id) return;                                        // stale or spoofed
+  if (buf_[2] & 0x02) st_.truncated++;
+  DnsQuestion cq;
+  if (s.qlen && matcher_.ready() && dnsCnameTargetBlocked(buf_, (size_t)n, matcher_) && dnsParseQuestion(s.q, s.qlen, cq)) {
+    // CNAME-cloaked tracker: the name looked harmless but resolves through a blocked domain.
+    size_t rn = dnsBuildBlockedReply(s.q, s.qlen, cq, out_, sizeof(out_));
+    if (rn) {
+      putBe16(out_, s.clientId);
+      sockaddr_in cto;
+      memset(&cto, 0, sizeof(cto));
+      cto.sin_family = AF_INET;
+      cto.sin_addr.s_addr = s.clientIp;
+      cto.sin_port = s.clientPort;
+      uint32_t cip = s.clientIp;
+      s.used = false;
+      st_.answered++;
+      st_.blocked++;
+      st_.cnameBlocked++;
+      noteBlocked(cq.name);
+      markClientBlocked(cip);
+      sendto(srv_, out_, rn, 0, (sockaddr*)&cto, sizeof(cto));
+      return;
+    }
+  }
   putBe16(buf_, s.clientId);
   sockaddr_in to;
   memset(&to, 0, sizeof(to));

@@ -27,8 +27,21 @@ size_t dnsBuildBlockedReply(const uint8_t* query, size_t qlen, const DnsQuestion
 
 struct DnsStats {
   uint32_t total, blocked, forwarded, answered, timeouts, retried, overflow, malformed;
-  DnsStats() : total(0), blocked(0), forwarded(0), answered(0), timeouts(0), retried(0), overflow(0), malformed(0) {}
+  uint32_t cnameBlocked;  // replies discarded because a CNAME target is on the blocklist (cloaked trackers)
+  uint32_t truncated;     // upstream replies with the TC bit set (clients would retry over TCP, which is not served)
+  uint32_t canary;        // encrypted-DNS canary lookups answered with NXDOMAIN
+  DnsStats() : total(0), blocked(0), forwarded(0), answered(0), timeouts(0), retried(0), overflow(0), malformed(0),
+               cnameBlocked(0), truncated(0), canary(0) {}
 };
+
+// True if the answer section of an upstream reply holds a CNAME whose target is blocked.
+bool dnsCnameTargetBlocked(const uint8_t* pkt, size_t len, Matcher& m);
+
+// Names browsers/OSes use to decide whether they may bypass the network's DNS with DoH.
+bool dnsIsDohCanary(const char* name);
+
+// NXDOMAIN reply for a query (used for the canary names).
+size_t dnsBuildNxdomain(const uint8_t* query, const DnsQuestion& q, uint8_t* out, size_t cap);
 
 struct ClientStat {
   uint32_t ip;  // network byte order
@@ -80,6 +93,7 @@ class DnsServer {
   void forward(uint8_t* pkt, size_t n, uint32_t ip, uint16_t port);
   void sweep();
   void noteClient(uint32_t ip, bool blocked);
+  void markClientBlocked(uint32_t ip);
   void noteBlocked(const char* name);
   static uint32_t nowMs();
 

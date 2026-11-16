@@ -1,0 +1,4 @@
+# Domains that must never be blocked, one per line. Matches the exact name only:
+# allowing "shop.example.com" does not help if "example.com" itself is on a list.
+# Example:
+# links.mybank.com

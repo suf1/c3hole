@@ -36,7 +36,9 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <div class=card><h2>Queries</h2><div class=big id=total>-</div><div class=bar><i id=pbar style="width:0"></i></div>
 <div class=row><span>Blocked</span><b id=blocked>-</b></div><div class=row><span>Blocked share</span><b id=share>-</b></div>
 <div class=row><span>Forwarded / answered</span><b id=fwd>-</b></div><div class=row><span>In flight now</span><b id=pend>-</b></div>
-<div class=row><span>Timeouts / retries</span><b id=tmo>-</b></div></div>
+<div class=row><span>Timeouts / retries</span><b id=tmo>-</b></div>
+<div class=row><span>Cloaked trackers caught</span><b id=cname>-</b></div>
+<div class=row><span>Truncated replies (need TCP)</span><b id=trunc>-</b></div></div>
 
 <div class=card><h2>Blocklist</h2><div class=big id=count>-</div>
 <div class=row><span>Status</span><b id=blst>-</b></div><div class=row><span>Built</span><b id=blbuilt>-</b></div>
@@ -115,7 +117,7 @@ async function refresh(){try{const s=await api('/api/status');
 $('ver').textContent='v'+s.ver+' - '+s.slot;const d=s.dns,m=s.match,b=s.bloom,l=s.bl,u=s.upd;
 $('total').textContent=fmt(d.total);$('blocked').textContent=fmt(d.blocked);
 const sh=d.total?100*d.blocked/d.total:0;$('share').textContent=sh.toFixed(1)+'%';$('pbar').style.width=sh+'%';
-$('fwd').textContent=fmt(d.forwarded)+' / '+fmt(d.answered);$('pend').textContent=d.pending+' / 32';$('tmo').textContent=d.timeouts+' / '+d.retried;
+$('fwd').textContent=fmt(d.forwarded)+' / '+fmt(d.answered);$('pend').textContent=d.pending+' / 32';$('tmo').textContent=d.timeouts+' / '+d.retried;$('cname').textContent=fmt(d.cname);$('trunc').textContent=fmt(d.trunc);
 $('count').textContent=l.valid?fmt(l.count):'no list';$('blst').textContent=l.valid?'active':'EMPTY - fetch or upload a list';$('blst').className=l.valid?'ok':'bad';
 $('blbuilt').textContent=l.valid?when(l.created):'-';$('blcap').textContent=l.valid?(100*l.count/l.max).toFixed(0)+'% of '+fmt(l.max):'-';
 $('blmode').textContent=l.valid?l.mode:'-';$('bllast').textContent=l.last+(l.lastOk?' ('+when(l.lastOk)+')':'');

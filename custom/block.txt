@@ -1,0 +1,3 @@
+# Extra domains to block, one per line (a domain also blocks all of its subdomains).
+# Example:
+# tracker.annoying-site.com

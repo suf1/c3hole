@@ -42,7 +42,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p build
-          python tools/build_blocklist.py build/blocklist.bin $BLOCKLIST_SOURCES $BLOCKLIST_EXTRA_ARGS
+          SRC="$BLOCKLIST_SOURCES"; EXTRA="$BLOCKLIST_EXTRA_ARGS"
+          [ -f custom/block.txt ] && SRC="$SRC custom/block.txt"        # your own extra domains
+          [ -f custom/allow.txt ] && EXTRA="$EXTRA --allow custom/allow.txt"   # domains you never want blocked
+          python tools/build_blocklist.py build/blocklist.bin $SRC $EXTRA
 
       - name: Build firmware
         run: pio run -e c3
