@@ -53,7 +53,7 @@ and the header is written last, so an interrupted update never leaves a half-val
 Auto-update: put this in the flasher's *Auto-update URL* (or later in the dashboard) and the device
 re-downloads the weekly list by itself:
 
-    https://github.com/<you>/<repo>/releases/download/latest/blocklist.bin
+    https://github.com/suf1/c3hole/releases/download/latest/blocklist.bin
 
 Firmware OTA works the same way with `.../firmware.bin` (dashboard > Settings > Firmware URL,
 then **Update firmware from URL**) or by uploading `firmware.bin` in the dashboard.
