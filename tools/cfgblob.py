@@ -27,7 +27,7 @@ TX_POWERS = {  # quarter-dBm value used by the firmware -> dBm label
 
 def build_cfg(ssid, wifi_pass, dash_password, bloom_kb=128, up1="8.8.8.8", up2="9.9.9.9",
               bl_url="", fw_url="", bl_hours=24, host="c3hole", salt=None,
-              no_auth=False, tx_power=44, ps_mode=0, cpu_mhz=160, up_mode=0, up_timeout=800):
+              no_auth=False, tx_power=44, ps_mode=0, cpu_mhz=160, up_mode=1, up_timeout=500):
     """dash_password is ignored when no_auth is True (the dashboard is then open to the LAN)."""
     for n, v in (("ssid", ssid), ("wifi password", wifi_pass), ("dashboard password", dash_password or ""),
                  ("blocklist url", bl_url), ("firmware url", fw_url), ("hostname", host), ("upstream 1", up1),

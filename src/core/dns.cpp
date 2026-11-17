@@ -20,6 +20,8 @@ namespace c3 {
 
 static inline uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static inline void putBe16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static inline uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+static inline void putBe32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
 
 bool dnsParseQuestion(const uint8_t* pkt, size_t len, DnsQuestion& q) {
   if (len < 12 + 5) return false;
@@ -153,6 +155,79 @@ size_t dnsBuildNxdomain(const uint8_t* query, const DnsQuestion& q, uint8_t* out
   return q.qend;
 }
 
+struct RrScan {
+  uint32_t minTtl;
+  size_t endAuth;
+  size_t ttlPos[32];
+  int nTtl;
+  uint16_t an, ns;
+};
+
+// Walks the answer + authority records of a single-question message.
+static bool scanRecords(const uint8_t* p, size_t len, RrScan& r) {
+  if (len < 12 || be16(p + 4) != 1) return false;
+  uint16_t an = be16(p + 6), ns = be16(p + 8);
+  if ((uint32_t)an + ns > 32) return false;
+  size_t pos = readName(p, len, 12, nullptr, 0);
+  if (!pos || pos + 4 > len) return false;
+  pos += 4;
+  r.minTtl = 0xFFFFFFFFu; r.nTtl = 0; r.an = an; r.ns = ns;
+  for (uint32_t i = 0; i < (uint32_t)an + ns; i++) {
+    pos = readName(p, len, pos, nullptr, 0);
+    if (!pos || pos + 10 > len) return false;
+    uint16_t type = be16(p + pos), rdl = be16(p + pos + 8);
+    uint32_t ttl = be32(p + pos + 4);
+    if (pos + 10 + rdl > len) return false;
+    if (type != 41) { if (ttl < r.minTtl) r.minTtl = ttl; r.ttlPos[r.nTtl++] = pos + 4; }
+    pos += 10 + rdl;
+  }
+  r.endAuth = pos;
+  return true;
+}
+
+// Copies a reply for caching: no additional section (so no OPT), TC clear, NOERROR/NXDOMAIN only.
+static size_t dnsMakeCacheable(const uint8_t* reply, size_t len, uint8_t* out, size_t cap, uint32_t& ttl) {
+  if (len < 12 || !(reply[2] & 0x80) || (reply[2] & 0x02) || ((reply[2] >> 3) & 0x0F) != 0) return 0;
+  uint8_t rc = reply[3] & 0x0F;
+  if (rc != 0 && rc != 3) return 0;
+  RrScan r;
+  if (!scanRecords(reply, len, r) || r.endAuth > cap) return 0;
+  memcpy(out, reply, r.endAuth);
+  putBe16(out + 10, 0);                                   // ARCOUNT = 0
+  ttl = r.nTtl ? r.minTtl : 30;
+  return r.endAuth;
+}
+
+static void dnsPatchTtls(uint8_t* p, size_t len, uint32_t ttl) {
+  RrScan r;
+  if (!scanRecords(p, len, r)) return;
+  for (int i = 0; i < r.nTtl; i++) putBe32(p + r.ttlPos[i], ttl);
+}
+
+// True if the query carries an EDNS OPT record with the DNSSEC-OK bit (such answers are never cached).
+static bool queryWantsDnssec(const uint8_t* p, size_t len, size_t qend) {
+  if (len < 12 || be16(p + 10) == 0) return false;
+  size_t pos = qend;
+  uint32_t total = (uint32_t)be16(p + 6) + be16(p + 8) + be16(p + 10);
+  for (uint32_t i = 0; i < total && i < 16; i++) {
+    pos = readName(p, len, pos, nullptr, 0);
+    if (!pos || pos + 10 > len) return false;
+    if (be16(p + pos) == 41 && (be16(p + pos + 6) & 0x8000)) return true;
+    pos += 10 + be16(p + pos + 8);
+  }
+  return false;
+}
+
+static uint64_t cacheKeyFor(const DnsQuestion& q) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (uint16_t i = 0; i < q.nameLen; i++) { h ^= (uint8_t)q.name[i]; h *= 0x100000001b3ULL; }
+  h ^= ((uint64_t)q.qtype << 32) | ((uint64_t)q.qclass << 16) | 1u;
+  h *= 0x100000001b3ULL;
+  return h;
+}
+
+static inline uint8_t lc(uint8_t c) { return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c; }
+
 uint32_t DnsServer::nowMs() {
   return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -160,8 +235,10 @@ uint32_t DnsServer::nowMs() {
 
 DnsServer::DnsServer(Matcher& matcher, uint32_t (*rng)())
     : matcher_(matcher), rng_(rng), srv_(-1), up_(-1), up1_(0), up2_(0), timeoutMs_(1500), up1Port_(53), up2Port_(53), parallel_(false),
+      tcp_(-1), probeMs_(0), lastProbeMs_(0), lastOkMs_(0), cMin_(20), cMax_(600), cStale_(600), cacheBytes_(0),
       recentHead_(0), recentCount_(0) {
   lastRead_ = false;
+  memset(cache_, 0, sizeof(cache_));
   memset(slots_, 0, sizeof(slots_));
   memset(recent_, 0, sizeof(recent_));
   memset(clients_, 0, sizeof(clients_));
@@ -196,14 +273,39 @@ bool DnsServer::begin(uint16_t port, uint32_t up1, uint32_t up2) {
   b.sin_port = 0;
   if (bind(up_, (sockaddr*)&b, sizeof(b)) != 0) { end(); return false; }
   if (!setNonBlocking(srv_) || !setNonBlocking(up_)) { end(); return false; }
+  lastOkMs_ = nowMs();
+  lastProbeMs_ = lastOkMs_;
   return true;
 }
 
 void DnsServer::end() {
   if (srv_ >= 0) close(srv_);
   if (up_ >= 0) close(up_);
-  srv_ = up_ = -1;
+  if (tcp_ >= 0) close(tcp_);
+  srv_ = up_ = tcp_ = -1;
   memset(slots_, 0, sizeof(slots_));
+  cacheClear();
+}
+
+void DnsServer::cacheClear() {
+  std::lock_guard<std::mutex> g(cacheMu_);
+  for (int i = 0; i < kCache; i++) { free(cache_[i].data); cache_[i].data = nullptr; }
+  cacheBytes_ = 0;
+}
+
+void DnsServer::sendTo(int fd, const uint8_t* p, size_t n, uint32_t ip, uint16_t port) {
+  sockaddr_in to;
+  memset(&to, 0, sizeof(to));
+  to.sin_family = AF_INET;
+  to.sin_addr.s_addr = ip;
+  to.sin_port = port;               // already in network byte order (as received)
+  sendto(fd, p, n, 0, (sockaddr*)&to, sizeof(to));
+}
+
+void DnsServer::noteRtt(uint32_t rtt) {
+  if (rtt > 400) st_.slow++;
+  if (rtt > st_.rttMax) st_.rttMax = rtt;
+  st_.rttAvg = st_.rttAvg ? (st_.rttAvg * 7 + rtt) / 8 : rtt;
 }
 
 void DnsServer::setUpstreams(uint32_t up1, uint32_t up2) { up1_ = up1; up2_ = up2; }
@@ -237,6 +339,7 @@ void DnsServer::step(int waitMs) {
       for (int i = 0; i < 32; i++) { onClient(); if (!lastRead_) break; }
   }
   sweep();
+  if (probeMs_ && nowMs() - lastProbeMs_ >= probeMs_) { lastProbeMs_ = nowMs(); sendProbe(); }
 }
 
 void DnsServer::noteBlocked(const char* name) {
@@ -345,6 +448,25 @@ void DnsServer::onClient() {
       return;
     }
   }
+  if (q.qclass == 1 && !queryWantsDnssec(buf_, (size_t)n, q.qend)) {
+    size_t cl = 0;
+    if (cacheGet(q, buf_, false, out_, sizeof(out_), cl)) {
+      st_.cacheHits++;
+      if (matcher_.ready() && dnsCnameTargetBlocked(out_, cl, matcher_)) {      // list may have changed since caching
+        size_t rn = dnsBuildBlockedReply(buf_, (size_t)n, q, out_, sizeof(out_));
+        if (rn) {
+          st_.blocked++; st_.cnameBlocked++;
+          noteBlocked(q.name);
+          markClientBlocked(ip);
+          sendTo(srv_, out_, rn, ip, port);
+          return;
+        }
+      }
+      sendTo(srv_, out_, cl, ip, port);
+      return;
+    }
+    st_.cacheMisses++;
+  }
   forward(buf_, (size_t)n, ip, port);
 }
 
@@ -366,6 +488,7 @@ void DnsServer::forward(uint8_t* pkt, size_t n, uint32_t ip, uint16_t port) {
   s.clientIp = ip;
   s.clientPort = port;
   s.tsMs = now;
+  s.firstMs = now;
   s.tries = 0;
   s.upId = (uint16_t)((rng_() & 0xFFE0u) | (uint32_t)slot);
   putBe16(pkt, s.upId);
@@ -396,9 +519,15 @@ void DnsServer::onUpstream() {
   uint16_t id = be16(buf_);
   Slot& s = slots_[id & (kSlots - 1)];
   if (!s.used || s.upId != id) return;                                        // stale or spoofed
+  uint32_t now = nowMs();
+  lastOkMs_ = now;
+  noteRtt(now - s.firstMs);
+  if (s.clientIp == 0) { s.used = false; st_.probeOk++; return; }             // heartbeat reply
   if (buf_[2] & 0x02) st_.truncated++;
   DnsQuestion cq;
-  if (s.qlen && matcher_.ready() && dnsCnameTargetBlocked(buf_, (size_t)n, matcher_) && dnsParseQuestion(s.q, s.qlen, cq)) {
+  bool haveQ = s.qlen && dnsParseQuestion(s.q, s.qlen, cq) && cq.qclass == 1;
+  if (haveQ && !queryWantsDnssec(s.q, s.qlen, cq.qend)) cachePut(cq, s.q, buf_, (size_t)n);
+  if (haveQ && matcher_.ready() && dnsCnameTargetBlocked(buf_, (size_t)n, matcher_)) {
     // CNAME-cloaked tracker: the name looked harmless but resolves through a blocked domain.
     size_t rn = dnsBuildBlockedReply(s.q, s.qlen, cq, out_, sizeof(out_));
     if (rn) {
@@ -435,21 +564,266 @@ void DnsServer::sweep() {
   for (int i = 0; i < kSlots; i++) {
     Slot& s = slots_[i];
     if (!s.used || (now - s.tsMs) < timeoutMs_) continue;
-    if (!parallel_ && s.tries == 0 && up2_ && s.qlen) {
-      sockaddr_in to;
-      memset(&to, 0, sizeof(to));
-      to.sin_family = AF_INET;
-      to.sin_addr.s_addr = up2_;
-      to.sin_port = htons(up2Port_);
-      sendto(up_, s.q, s.qlen, 0, (sockaddr*)&to, sizeof(to));
+    if (s.tries == 0 && s.qlen) {            // first silence: resend once (UDP gets lost), possibly to the other server
+      if (parallel_ || !up2_) sendTo(up_, s.q, s.qlen, up1_, htons(up1Port_));
+      if (up2_) sendTo(up_, s.q, s.qlen, up2_, htons(up2Port_));
       s.tries = 1;
       s.tsMs = now;
       st_.retried++;
-    } else {
-      s.used = false;
-      st_.timeouts++;
+      continue;
     }
+    bool probe = s.clientIp == 0;
+    s.used = false;
+    if (probe) { st_.probeFail++; continue; }
+    DnsQuestion q;
+    size_t cl = 0;
+    if (s.qlen && dnsParseQuestion(s.q, s.qlen, q) && cacheGet(q, s.q, true, out_, sizeof(out_), cl)) {
+      putBe16(out_, s.clientId);              // upstream failed but we remember an answer: better stale than nothing
+      if (matcher_.ready() && dnsCnameTargetBlocked(out_, cl, matcher_)) {
+        size_t rn = dnsBuildBlockedReply(s.q, s.qlen, q, out_, sizeof(out_));
+        if (rn) { putBe16(out_, s.clientId); cl = rn; st_.blocked++; st_.cnameBlocked++; }
+      }
+      st_.staleServed++;
+      st_.answered++;
+      sendTo(srv_, out_, cl, s.clientIp, s.clientPort);
+      continue;
+    }
+    st_.timeouts++;
   }
+}
+
+void DnsServer::sendProbe() {
+  if (!up1_) return;
+  int slot = -1;
+  for (int i = 0; i < kSlots; i++) if (!slots_[i].used) { slot = i; break; }
+  if (slot < 0) return;                                   // busy: real queries are proof enough
+  uint8_t pkt[17] = {0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0 /*root*/, 0, 2 /*NS*/, 0, 1 /*IN*/};
+  Slot& s = slots_[slot];
+  memset(&s, 0, sizeof(s));
+  s.used = true;
+  s.clientIp = 0;                                         // marks an internal probe
+  s.tsMs = s.firstMs = nowMs();
+  s.tries = 1;                                            // no resend: a probe either answers or counts as a failure
+  s.upId = (uint16_t)((rng_() & 0xFFE0u) | (uint32_t)slot);
+  putBe16(pkt, s.upId);
+  sendTo(up_, pkt, sizeof(pkt), up1_, htons(up1Port_));
+  if (parallel_ && up2_) sendTo(up_, pkt, sizeof(pkt), up2_, htons(up2Port_));
+}
+
+// ------------------------------------------------------------------ cache
+bool DnsServer::cacheGet(const DnsQuestion& q, const uint8_t* query, bool stale, uint8_t* out, size_t cap, size_t& len) {
+  std::lock_guard<std::mutex> g(cacheMu_);
+  uint64_t key = cacheKeyFor(q);
+  uint32_t now = nowMs();
+  size_t ql = q.qend - 12;
+  for (int i = 0; i < kCache; i++) {
+    CacheEntry& e = cache_[i];
+    if (!e.data || e.key != key || e.len < 12 + ql || e.len > cap) continue;
+    bool same = true;
+    for (size_t k = 0; k < ql; k++) if (lc(e.data[12 + k]) != lc(query[12 + k])) { same = false; break; }
+    if (!same) continue;
+    uint32_t age = now - e.storedMs;
+    bool fresh = age < e.ttlMs;
+    if (!fresh && !(stale && age < e.ttlMs + cStale_ * 1000UL)) continue;
+    memcpy(out, e.data, e.len);
+    putBe16(out, be16(query));
+    out[2] = (uint8_t)((out[2] & 0xFE) | (query[2] & 0x01) | 0x80);
+    uint32_t remain = fresh ? (e.ttlMs - age) / 1000 : 30;
+    dnsPatchTtls(out, e.len, remain < 1 ? 1 : remain);
+    e.lastUse = now;
+    len = e.len;
+    return true;
+  }
+  return false;
+}
+
+void DnsServer::cachePut(const DnsQuestion& q, const uint8_t* query, const uint8_t* reply, size_t rlen) {
+  uint8_t tmp[kCacheMaxEntry];
+  uint32_t ttl = 0;
+  size_t n = dnsMakeCacheable(reply, rlen, tmp, sizeof(tmp), ttl);
+  size_t ql = q.qend - 12;
+  if (!n || n < 12 + ql) return;
+  for (size_t k = 0; k < ql; k++) if (lc(tmp[12 + k]) != lc(query[12 + k])) return;   // reply must echo our question
+  if (ttl < cMin_) ttl = cMin_;
+  if (ttl > cMax_) ttl = cMax_;
+  uint8_t* copy = (uint8_t*)malloc(n);
+  if (!copy) return;
+  memcpy(copy, tmp, n);
+  uint64_t key = cacheKeyFor(q);
+  uint32_t now = nowMs();
+  std::lock_guard<std::mutex> g(cacheMu_);
+  int slot = -1;
+  for (int i = 0; i < kCache; i++)                          // same question: replace
+    if (cache_[i].data && cache_[i].key == key) { slot = i; break; }
+  if (slot >= 0) { cacheBytes_ -= cache_[slot].len; free(cache_[slot].data); cache_[slot].data = nullptr; }
+  for (;;) {                                                // make room: free slot first, else least recently used
+    if (slot < 0) for (int i = 0; i < kCache; i++) if (!cache_[i].data) { slot = i; break; }
+    if (slot >= 0 && cacheBytes_ + n <= (uint32_t)kCacheBytes) break;
+    int lru = -1;
+    for (int i = 0; i < kCache; i++)
+      if (cache_[i].data && (lru < 0 || (now - cache_[i].lastUse) > (now - cache_[lru].lastUse))) lru = i;
+    if (lru < 0) { free(copy); return; }
+    cacheBytes_ -= cache_[lru].len; free(cache_[lru].data); cache_[lru].data = nullptr;
+    if (slot < 0) slot = lru;
+  }
+  CacheEntry& e = cache_[slot];
+  e.key = key; e.storedMs = now; e.ttlMs = ttl * 1000UL; e.lastUse = now; e.len = (uint16_t)n; e.data = copy;
+  cacheBytes_ += (uint32_t)n;
+}
+
+// ------------------------------------------------------------------ TCP
+static bool recvAll(int fd, uint8_t* p, size_t n) {
+  while (n) {
+    ssize_t r = recv(fd, p, n, 0);
+    if (r <= 0) return false;
+    p += r; n -= (size_t)r;
+  }
+  return true;
+}
+
+static bool sendAll(int fd, const uint8_t* p, size_t n) {
+  while (n) {
+    ssize_t r = send(fd, p, n, 0);
+    if (r <= 0) return false;
+    p += r; n -= (size_t)r;
+  }
+  return true;
+}
+
+bool DnsServer::beginTcp(uint16_t port) {
+  if (tcp_ >= 0) close(tcp_);
+  tcp_ = socket(AF_INET, SOCK_STREAM, 0);
+  if (tcp_ < 0) return false;
+  int one = 1;
+  setsockopt(tcp_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_ANY);
+  a.sin_port = htons(port);
+  if (bind(tcp_, (sockaddr*)&a, sizeof(a)) != 0 || listen(tcp_, 2) != 0) { close(tcp_); tcp_ = -1; return false; }
+  return true;
+}
+
+void DnsServer::tcpStep(int waitMs) {
+  if (tcp_ < 0) return;
+  fd_set rf;
+  FD_ZERO(&rf);
+  FD_SET(tcp_, &rf);
+  timeval tv;
+  tv.tv_sec = waitMs / 1000;
+  tv.tv_usec = (waitMs % 1000) * 1000;
+  if (select(tcp_ + 1, &rf, nullptr, nullptr, &tv) <= 0) return;
+  sockaddr_in from;
+  socklen_t fl = sizeof(from);
+  int c = accept(tcp_, (sockaddr*)&from, &fl);
+  if (c < 0) return;
+  handleTcpConn(c, from.sin_addr.s_addr);
+  close(c);
+}
+
+void DnsServer::handleTcpConn(int fd, uint32_t clientIp) {
+  timeval tv;
+  tv.tv_sec = 2; tv.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  for (int i = 0; i < 8; i++) {                         // a client may pipeline a few queries on one connection
+    uint8_t lb[2];
+    if (!recvAll(fd, lb, 2)) break;
+    size_t ql = ((size_t)lb[0] << 8) | lb[1];
+    if (ql < 12 || ql > kTcpBuf - 2 || !recvAll(fd, tcpIn_, ql)) break;
+    st_.total++;
+    st_.tcpQueries++;
+    size_t rl = 0;
+    if (!handleTcpQuery(tcpIn_, ql, clientIp, tcpOut_ + 2, kTcpBuf - 2, rl)) break;
+    tcpOut_[0] = (uint8_t)(rl >> 8);
+    tcpOut_[1] = (uint8_t)rl;
+    if (!sendAll(fd, tcpOut_, rl + 2)) break;
+  }
+}
+
+bool DnsServer::tcpForward(const uint8_t* query, size_t qlen, uint8_t* reply, size_t cap, size_t& rlen) {
+  uint32_t ips[2] = {up1_, up2_};
+  uint16_t ports[2] = {up1Port_, up2Port_};
+  for (int t = 0; t < 2; t++) {
+    if (!ips[t]) continue;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) continue;
+    sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = ips[t];
+    to.sin_port = htons(ports[t]);
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    bool ok = false;
+    int rc = connect(fd, (sockaddr*)&to, sizeof(to));
+    if (rc != 0 && errno == EINPROGRESS) {
+      fd_set wf;
+      FD_ZERO(&wf);
+      FD_SET(fd, &wf);
+      timeval tv = {1, 500000};
+      int err = 1;
+      socklen_t el = sizeof(err);
+      if (select(fd + 1, nullptr, &wf, nullptr, &tv) > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) rc = 0;
+    }
+    if (rc == 0) {
+      fcntl(fd, F_SETFL, fl);
+      timeval tv = {1, 500000};
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+      uint8_t hdr[2] = {(uint8_t)(qlen >> 8), (uint8_t)qlen};
+      uint8_t lb[2];
+      if (sendAll(fd, hdr, 2) && sendAll(fd, query, qlen) && recvAll(fd, lb, 2)) {
+        size_t rl = ((size_t)lb[0] << 8) | lb[1];
+        if (rl >= 12 && rl <= cap && recvAll(fd, reply, rl) && be16(reply) == be16(query)) { rlen = rl; ok = true; }
+      }
+    }
+    close(fd);
+    if (ok) return true;
+  }
+  return false;
+}
+
+bool DnsServer::handleTcpQuery(const uint8_t* query, size_t qlen, uint32_t clientIp, uint8_t* out, size_t cap, size_t& rlen) {
+  DnsQuestion q;
+  if (!dnsParseQuestion(query, qlen, q)) return tcpForward(query, qlen, out, cap, rlen);
+  if (q.qclass == 1 && dnsIsDohCanary(q.name)) {
+    noteClient(clientIp, false);
+    st_.canary++;
+    rlen = dnsBuildNxdomain(query, q, out, cap);
+    return rlen > 0;
+  }
+  bool blocked = q.qclass == 1 && matcher_.isBlocked(q.name, q.nameLen);
+  noteClient(clientIp, blocked);
+  if (blocked) {
+    rlen = dnsBuildBlockedReply(query, qlen, q, out, cap);
+    if (rlen) { st_.blocked++; noteBlocked(q.name); return true; }
+  }
+  bool dnssec = queryWantsDnssec(query, qlen, q.qend);
+  if (q.qclass == 1 && !dnssec && cacheGet(q, query, false, out, cap, rlen)) {
+    st_.cacheHits++;
+    if (!(matcher_.ready() && dnsCnameTargetBlocked(out, rlen, matcher_))) return true;
+    rlen = dnsBuildBlockedReply(query, qlen, q, out, cap);
+    if (rlen) { st_.blocked++; st_.cnameBlocked++; noteBlocked(q.name); markClientBlocked(clientIp); return true; }
+  }
+  if (tcpForward(query, qlen, out, cap, rlen)) {
+    if (q.qclass == 1 && !dnssec) cachePut(q, query, out, rlen);
+    if (matcher_.ready() && dnsCnameTargetBlocked(out, rlen, matcher_)) {
+      size_t rn = dnsBuildBlockedReply(query, qlen, q, out, cap);
+      if (rn) { rlen = rn; st_.blocked++; st_.cnameBlocked++; noteBlocked(q.name); markClientBlocked(clientIp); }
+    }
+    return true;
+  }
+  if (q.qclass == 1 && !dnssec && cacheGet(q, query, true, out, cap, rlen)) { st_.staleServed++; return true; }
+  if (cap < q.qend) return false;                       // SERVFAIL: tell the client instead of leaving it hanging
+  memcpy(out, query, q.qend);
+  out[2] = (uint8_t)(0x80 | (query[2] & 0x01));
+  out[3] = 0x82;
+  putBe16(out + 6, 0); putBe16(out + 8, 0); putBe16(out + 10, 0);
+  rlen = q.qend;
+  st_.timeouts++;
+  return true;
 }
 
 }  // namespace c3

@@ -45,8 +45,8 @@ struct Config {
     psMode = 0;
     cpuMhz = 160;
     noAuth = false;
-    upMode = 0;
-    upTimeoutMs = 800;
+    upMode = 1;           // ask both upstreams at once: one flaky resolver cannot stall every query
+    upTimeoutMs = 500;
   }
 
   bool configured() const { return ssid[0] != 0 && (dashHash[0] != 0 || noAuth); }

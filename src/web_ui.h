@@ -51,6 +51,12 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <div class=row><span>Free heap (min)</span><b id=heap>-</b></div><div class=row><span>Uptime</span><b id=up>-</b></div>
 <div class=row><span>Wi-Fi</span><b id=wifi>-</b></div></div>
 
+<div class=card><h2>Reliability</h2>
+<div class=row><span>Answered from cache</span><b id=chit>-</b></div><div class=row><span>Stale answers served</span><b id=stale>-</b></div>
+<div class=row><span>Upstream latency (avg / worst)</span><b id=rtt>-</b></div><div class=row><span>Slow upstream replies</span><b id=slow>-</b></div>
+<div class=row><span>Heartbeat ok / failed</span><b id=pok>-</b></div><div class=row><span>TCP queries</span><b id=tcp>-</b></div>
+<small>Queries answered from cache never wait for the internet; stale answers keep sites working if the upstream briefly fails.</small></div>
+
 <div class=card><h2>System health</h2>
 <div class=row><span>Chip temperature</span><b id=temp>-</b></div><div class=row><span>CPU</span><b id=cpu>-</b></div>
 <div class=row><span>Last restart reason</span><b id=reset>-</b></div><div class=row><span>Wi-Fi drops (last reason)</span><b id=drops>-</b></div>
@@ -118,6 +124,8 @@ $('ver').textContent='v'+s.ver+' - '+s.slot;const d=s.dns,m=s.match,b=s.bloom,l=
 $('total').textContent=fmt(d.total);$('blocked').textContent=fmt(d.blocked);
 const sh=d.total?100*d.blocked/d.total:0;$('share').textContent=sh.toFixed(1)+'%';$('pbar').style.width=sh+'%';
 $('fwd').textContent=fmt(d.forwarded)+' / '+fmt(d.answered);$('pend').textContent=d.pending+' / 32';$('tmo').textContent=d.timeouts+' / '+d.retried;$('cname').textContent=fmt(d.cname);$('trunc').textContent=fmt(d.trunc);
+$('chit').textContent=fmt(d.chit)+' ('+(d.chit+d.cmiss?Math.round(100*d.chit/(d.chit+d.cmiss)):0)+'%)';$('stale').textContent=fmt(d.stale);
+$('rtt').textContent=d.rtt+' / '+d.rttmax+' ms';$('slow').textContent=fmt(d.slow);$('pok').textContent=fmt(d.pok)+' / '+fmt(d.pfail);$('tcp').textContent=fmt(d.tcp);
 $('count').textContent=l.valid?fmt(l.count):'no list';$('blst').textContent=l.valid?'active':'EMPTY - fetch or upload a list';$('blst').className=l.valid?'ok':'bad';
 $('blbuilt').textContent=l.valid?when(l.created):'-';$('blcap').textContent=l.valid?(100*l.count/l.max).toFixed(0)+'% of '+fmt(l.max):'-';
 $('blmode').textContent=l.valid?l.mode:'-';$('bllast').textContent=l.last+(l.lastOk?' ('+when(l.lastOk)+')':'');

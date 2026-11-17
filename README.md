@@ -16,7 +16,7 @@ fits on a bare ESP32-C3 SuperMini.
 
 Domains block their subdomains automatically (`ads.example.com` is blocked when `example.com` is listed).
 
-## Measured on the host test suite (`sh tests/run_tests.sh`, 139 checks)
+## Measured on the host test suite (`sh tests/run_tests.sh`, 163 checks)
 
 * 253,000-domain list: every listed domain found, 0 false blocks in 200,000 random lookups.
 * Share of non-blocked lookups settled by the Bloom filter alone (0 flash reads) at 253K domains:
@@ -26,7 +26,7 @@ Domains block their subdomains automatically (`ads.example.com` is blocked when 
   a bigger filter only saves flash reads.
 * 32 simultaneous queries to a 250 ms upstream finish in ~252 ms (sequential: 8,000 ms).
 * Firmware links against the real Arduino-ESP32 2.0.17 / ESP-IDF 4.4 SDK with the Espressif
-  RISC-V GCC 8.4 toolchain: **1,101,840 bytes in a 1,310,720-byte OTA slot (84 %)**.
+  RISC-V GCC 8.4 toolchain: **1,112,048 bytes in a 1,310,720-byte OTA slot (85 %)**.
 
 ## Flash layout (4 MB)
 
@@ -53,7 +53,7 @@ and the header is written last, so an interrupted update never leaves a half-val
 Auto-update: put this in the flasher's *Auto-update URL* (or later in the dashboard) and the device
 re-downloads the weekly list by itself:
 
-    https://github.com/suf1/c3hole/releases/download/latest/blocklist.bin
+    https://github.com/<you>/<repo>/releases/download/latest/blocklist.bin
 
 Firmware OTA works the same way with `.../firmware.bin` (dashboard > Settings > Firmware URL,
 then **Update firmware from URL**) or by uploading `firmware.bin` in the dashboard.
@@ -91,8 +91,7 @@ get through. The usual reasons, most likely first:
 6. **The domain is not on the list.** Add your own in `custom/block.txt`, or add a bigger source in the workflow
    (for example Hagezi `pro.plus`); the builder refuses a list larger than the device holds (301,456 domains).
    More lists block more but also break more sites; keep `custom/allow.txt` for exceptions.
-7. **No TCP:53.** If an upstream reply is too big, a client retries over TCP and C3Hole does not answer it. The dashboard
-   counts these as *Truncated replies (need TCP)*; if that number grows, TCP support is worth adding.
+7. **TCP.** C3Hole now serves TCP:53 as well (clients retry over TCP when a UDP answer is truncated); *TCP queries* on the dashboard counts them.
 8. **Outages.** While the device is offline (see *Wi-Fi drops*), clients with another DNS server use it. Use only C3Hole
    in DHCP, give it a DHCP reservation, and for redundancy run **two** C3Holes as primary and secondary DNS.
 
@@ -103,7 +102,8 @@ Quick checks from a PC: `nslookup doubleclick.net <C3Hole IP>` must answer 0.0.0
 
 Pick a provider preset or type any IPv4 address, optionally with a port: `192.168.0.5` or `192.168.0.5:5353`
 (AdGuard Home, Unbound, Pi-hole, dnsmasq...). Two modes: *primary, then secondary after the failover timeout*
-(default 800 ms) or *ask both at once, first answer wins* (best against a flaky resolver, double the upstream traffic).
+or *ask both at once, first answer wins* (the default: one slow or flaky resolver can no longer delay or lose answers; costs
+double upstream traffic, which is negligible). Failover timeout default 500 ms; a silent query is resent once before giving up.
 Replies are accepted only from the configured IP **and** port. An upstream cannot be the device itself.
 Default: 8.8.8.8 + 9.9.9.9 (two providers).
 
@@ -125,6 +125,25 @@ Default: 8.8.8.8 + 9.9.9.9 (two providers).
 * The dashboard is plain HTTP on your LAN: do not port-forward it.
 * Hold the BOOT button for 5 s while running to erase all settings.
 * Names shown in "recently blocked" come from network clients and are sanitised.
+
+## Why it is as dependable as a Pi-hole (and what was wrong before)
+
+"Ads slip through, reconnecting Wi-Fi fixes it" means a device had **switched to another DNS server and stuck with it**
+(reconnecting re-reads DHCP and flushes its DNS state). Clients do that when the resolver is silent for about a second.
+Causes found and fixed in the firmware:
+
+| Cause | Fix |
+|---|---|
+| lwIP queues only **6** UDP datagrams per socket and its task (priority 18) outranked the DNS task (5): a page load fires dozens of lookups in milliseconds and the excess was dropped silently | DNS task now runs at priority 20, so each datagram is consumed the moment it arrives |
+| One slow upstream delayed every query by the failover timeout | Both upstreams are asked at once (default); lost queries are resent once |
+| Every lookup depended on the internet round trip | Answer cache (48 entries, 16 KB, TTL 20-600 s) and **serve-stale**: if the upstream fails, a remembered answer is used |
+| Clients retrying over TCP found nothing listening | TCP:53 server (also relays oversized answers) |
+| Wi-Fi "connected" but traffic not flowing | A heartbeat query every 15 s; no upstream answer for 90 s forces a Wi-Fi reconnect |
+| Flash erase/write during a list update stalled the DNS task, and every update blocked nothing for ~20 s | Erase/write in small pieces with pauses; an unchanged list is detected and not rewritten at all |
+
+The *Reliability* card on the dashboard shows cache hits, stale answers, upstream latency and heartbeat results.
+Remaining honest limits: while a **changed** list is installed (about every week, ~20 s) blocking is paused, and the router must
+not advertise any other DNS server (including an IPv6 one) or clients will use it.
 
 ## If the dashboard disappears after a while
 
@@ -150,8 +169,7 @@ Give the device a DHCP reservation in your router so its IP never changes.
 ## Limits you should know
 
 * DNS over UDP only (no TCP:53 fallback, no DoH/DoT). Clients that insist on DoH bypass any DNS blocker.
-* No DNS cache; every non-blocked query goes upstream.
-* No TCP:53 (see the truncated-replies counter).
+* No DNSSEC validation (DNSSEC-OK queries bypass the cache and are passed through untouched).
 * Manual blocklist upload erases the old list first (a failed upload leaves the device with no list until retried);
   the HTTPS update path is safe because it verifies before erasing.
 * Not run on hardware by the author of this package: see "Verification status".

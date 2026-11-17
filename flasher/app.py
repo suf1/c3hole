@@ -401,7 +401,7 @@ def main_gui():
     sv = lambda k, d: tk.StringVar(value=str(saved.get(k, d)))
     V = {"ssid": sv("ssid", ""), "bl_url": sv("bl_url", ""), "bl_hours": sv("bl_hours", "24"), "fw_url": sv("fw_url", ""),
          "up1": sv("up1", "8.8.8.8"), "up2": sv("up2", "9.9.9.9"), "bloom_kb": sv("bloom_kb", "128"),
-         "up_timeout": sv("up_timeout", "800")}
+         "up_timeout": sv("up_timeout", "500")}
     v_wpass, v_dpass = tk.StringVar(), tk.StringVar()
     v_noauth, v_erase = tk.BooleanVar(value=False), tk.BooleanVar(value=True)
     v_bl, v_blpath = tk.StringVar(value="Bundled list"), tk.StringVar()
@@ -413,7 +413,7 @@ def main_gui():
     v_ps = tk.StringVar(value=ps_opts[int(saved.get("ps_mode", 0))])
     v_cpu = tk.StringVar(value="%s MHz" % saved.get("cpu_mhz", 160))
     mode_opts = ["Primary, then 2nd", "Ask both at once"]
-    v_mode = tk.StringVar(value=mode_opts[int(saved.get("up_mode", 0))])
+    v_mode = tk.StringVar(value=mode_opts[int(saved.get("up_mode", 1))])
     v_preset = tk.StringVar()
 
     outer = ttk.Frame(root, padding=(10, 8))

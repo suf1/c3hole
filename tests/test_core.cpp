@@ -194,7 +194,7 @@ static void testConfig() {
   uint8_t blank[64]; memset(blank, 0xFF, sizeof(blank));
   CHECK(!d.parse(blank, sizeof(blank)), "erased flash is not a config");
   Config e; CHECK(!e.configured(), "default config is unconfigured");
-  CHECK(c.txPower == 44 && c.psMode == 0 && c.cpuMhz == 160 && !c.noAuth && c.upMode == 0 && c.upTimeoutMs == 800, "new-setting defaults");
+  CHECK(c.txPower == 44 && c.psMode == 0 && c.cpuMhz == 160 && !c.noAuth && c.upMode == 1 && c.upTimeoutMs == 500, "new-setting defaults (parallel upstreams, 500 ms)");
   CHECK(!strcmp(c.up1, "8.8.8.8"), "default upstream 1 '%s'", c.up1);
   {
     std::vector<uint8_t> ob = readFile(W + "cfg_open.bin");
@@ -294,17 +294,23 @@ struct ServerRunner {
   std::atomic<bool> stop;
   std::atomic<int> peak;
   uint16_t port;
-  ServerRunner(Matcher& m, uint32_t up1, uint32_t up2, uint16_t upPort, uint32_t timeoutMs)
+  std::thread tcpTh;
+  bool tcpOn = false;
+  void startTcp() {                                  // the TCP socket was bound in the constructor (wantTcp)
+    tcpOn = true;
+    tcpTh = std::thread([this] { while (!stop) srv.tcpStep(20); });
+  }
+  ServerRunner(Matcher& m, uint32_t up1, uint32_t up2, uint16_t upPort, uint32_t timeoutMs, bool wantTcp = false)
       : srv(m, rng32), stop(false), peak(0), port(0) {
     srv.setUpstreamPort(upPort);
     srv.setTimeoutMs(timeoutMs);
-    for (uint16_t p = 35300; p < 35400; p++) {   // find a free port
-      if (srv.begin(p, up1, up2)) { port = p; break; }
+    for (uint16_t p = 35300; p < 35400; p++) {   // find a port that is free for UDP (and TCP if wanted)
+      if (srv.begin(p, up1, up2) && (!wantTcp || srv.beginTcp(p))) { port = p; break; }
     }
     if (!port) { printf("no free port\n"); exit(2); }
     th = std::thread([this] { while (!stop) { srv.step(5); int p = srv.pending(); if (p > peak) peak = p; } });
   }
-  ~ServerRunner() { stop = true; th.join(); }
+  ~ServerRunner() { stop = true; th.join(); if (tcpOn) tcpTh.join(); }
 };
 
 struct Client {
@@ -606,6 +612,194 @@ static void testCnameCanaryTruncation() {
   }
 }
 
+// ---- helpers for the cache / TCP tests
+static void addA(std::vector<uint8_t>& p, uint32_t ttl) {          // one A record 1.2.3.4 owned by the question name
+  p[7] = 1;
+  p.push_back(0xC0); p.push_back(0x0C);
+  p.push_back(0); p.push_back(1); p.push_back(0); p.push_back(1);
+  p.push_back((uint8_t)(ttl >> 24)); p.push_back((uint8_t)(ttl >> 16)); p.push_back((uint8_t)(ttl >> 8)); p.push_back((uint8_t)ttl);
+  p.push_back(0); p.push_back(4); p.push_back(1); p.push_back(2); p.push_back(3); p.push_back(4);
+}
+
+static void addBigTxt(std::vector<uint8_t>& p) {                    // ~1.2 KB TXT record (needs TCP)
+  p[7] = 1;
+  p.push_back(0xC0); p.push_back(0x0C);
+  p.push_back(0); p.push_back(16); p.push_back(0); p.push_back(1);
+  p.push_back(0); p.push_back(0); p.push_back(0); p.push_back(60);
+  size_t rd = 5 * 241;
+  p.push_back((uint8_t)(rd >> 8)); p.push_back((uint8_t)rd);
+  for (int i = 0; i < 5; i++) { p.push_back(240); p.insert(p.end(), 240, (uint8_t)'a'); }
+}
+
+struct FakeTcpUpstream {
+  int lfd;
+  uint16_t port;
+  std::atomic<bool> stop;
+  std::atomic<int> received;
+  std::atomic<bool> big;
+  std::thread th;
+  explicit FakeTcpUpstream(uint16_t bindPort = 0) : lfd(-1), port(0), stop(false), received(0), big(false) {
+    lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_addr.s_addr = inet_addr("127.0.0.1"); a.sin_port = htons(bindPort);
+    if (bind(lfd, (sockaddr*)&a, sizeof(a)) != 0 || listen(lfd, 4) != 0) { perror("tcp upstream"); exit(2); }
+    socklen_t l = sizeof(a); getsockname(lfd, (sockaddr*)&a, &l); port = ntohs(a.sin_port);
+    th = std::thread([this] { run(); });
+  }
+  ~FakeTcpUpstream() { stop = true; th.join(); close(lfd); }
+  static bool rd(int fd, uint8_t* p, size_t n) { while (n) { ssize_t r = recv(fd, p, n, 0); if (r <= 0) return false; p += r; n -= (size_t)r; } return true; }
+  void run() {
+    while (!stop) {
+      fd_set rf; FD_ZERO(&rf); FD_SET(lfd, &rf); timeval tv = {0, 10000};
+      if (select(lfd + 1, &rf, nullptr, nullptr, &tv) <= 0) continue;
+      int c = accept(lfd, nullptr, nullptr);
+      if (c < 0) continue;
+      timeval t = {1, 0}; setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(t));
+      for (;;) {
+        uint8_t lb[2];
+        if (!rd(c, lb, 2)) break;
+        std::vector<uint8_t> q((size_t)((lb[0] << 8) | lb[1]));
+        if (!rd(c, q.data(), q.size())) break;
+        received++;
+        q[2] |= 0x80;
+        if (big) addBigTxt(q); else addA(q, 120);
+        std::vector<uint8_t> out; out.push_back((uint8_t)(q.size() >> 8)); out.push_back((uint8_t)q.size());
+        out.insert(out.end(), q.begin(), q.end());
+        send(c, out.data(), out.size(), 0);
+      }
+      close(c);
+    }
+  }
+};
+
+static std::vector<uint8_t> tcpQuery(uint16_t port, const uint8_t* q, size_t n) {
+  std::vector<uint8_t> reply;
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_addr.s_addr = inet_addr("127.0.0.1"); a.sin_port = htons(port);
+  if (connect(fd, (sockaddr*)&a, sizeof(a)) != 0) { close(fd); return reply; }
+  timeval t = {3, 0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(t));
+  std::vector<uint8_t> out; out.push_back((uint8_t)(n >> 8)); out.push_back((uint8_t)n); out.insert(out.end(), q, q + n);
+  send(fd, out.data(), out.size(), 0);
+  uint8_t lb[2];
+  if (FakeTcpUpstream::rd(fd, lb, 2)) {
+    reply.resize((size_t)((lb[0] << 8) | lb[1]));
+    if (!FakeTcpUpstream::rd(fd, reply.data(), reply.size())) reply.clear();
+  }
+  close(fd);
+  return reply;
+}
+
+static void testCacheAndStale() {
+  printf("[dns server: cache, DNSSEC bypass, serve-stale, heartbeat]\n");
+  uint8_t q[512], r[1500];
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) { addA(p, 120); };
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    size_t n = buildQuery(q, 0xA001, "www.cachetest.org", 1, false);
+    c.send(q, n);
+    CHECK(c.recv(r, sizeof(r), 800) > 0 && r[7] == 1, "first query answered by upstream");
+    n = buildQuery(q, 0xA002, "WWW.CacheTest.ORG", 1, false);              // other case, other ID
+    c.send(q, n);
+    int rn = c.recv(r, sizeof(r), 800);
+    CHECK(rn > 0 && r[0] == 0xA0 && r[1] == 0x02 && r[7] == 1 && r[11] == 0, "second query served from cache with its own ID, no OPT");
+    uint32_t ttl = ((uint32_t)r[n + 6] << 24) | ((uint32_t)r[n + 7] << 16) | ((uint32_t)r[n + 8] << 8) | r[n + 9];
+    CHECK(ttl >= 1 && ttl <= 120, "cached TTL counts down (%u)", ttl);
+    CHECK(up.received == 1 && sr.srv.stats().cacheHits == 1, "upstream asked once (asked %d, hits %u)", up.received.load(), sr.srv.stats().cacheHits);
+    DnsStats st = sr.srv.stats();
+    CHECK(st.rttMax > 0 && st.rttAvg > 0 && st.rttMax < 400, "round-trip time measured (avg %u max %u ms)", st.rttAvg, st.rttMax);
+    n = buildQuery(q, 0xA003, "www.cachetest.org", 28, false);              // AAAA is a different question
+    c.send(q, n); c.recv(r, sizeof(r), 800);
+    CHECK(up.received == 2, "different record type is not answered from the A cache");
+    n = buildQuery(q, 0xA004, "dnssec.cachetest.org", 1, true);
+    q[n - 11 + 7] |= 0x80;                                                 // DO bit
+    c.send(q, n); c.recv(r, sizeof(r), 800);
+    c.send(q, n); c.recv(r, sizeof(r), 800);
+    CHECK(up.received == 4 && sr.srv.stats().cacheHits == 1, "DNSSEC-OK queries bypass the cache (upstream %d)", up.received.load());
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) { addCname(p, "t.ads.tracker.io", false); };
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 1000);
+    Client c(sr.port);
+    for (int i = 0; i < 2; i++) {
+      size_t n = buildQuery(q, (uint16_t)(0xA101 + i), "x.cloaked2.test", 1, false);
+      c.send(q, n);
+      int rn = c.recv(r, sizeof(r), 800);
+      CHECK(rn > 4 && r[7] == 1 && memcmp(r + rn - 4, "\0\0\0\0", 4) == 0, "cloaked answer blocked (attempt %d)", i + 1);
+    }
+    CHECK(up.received == 1 && sr.srv.stats().cnameBlocked == 2, "second block came from the cache but was still re-checked (upstream %d, cname %u)", up.received.load(), sr.srv.stats().cnameBlocked);
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    up.mutate = [](std::vector<uint8_t>& p) { addA(p, 1); };
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 150);
+    sr.srv.setCacheLimits(1, 1, 30);
+    Client c(sr.port);
+    size_t n = buildQuery(q, 0xA201, "stale.example-test.org", 1, false);
+    c.send(q, n);
+    CHECK(c.recv(r, sizeof(r), 800) > 0 && r[7] == 1, "stale test: initial answer cached");
+    up.delayMs = 600000;                                                   // upstream goes silent
+    std::this_thread::sleep_for(std::chrono::milliseconds(1300));            // entry is now expired
+    n = buildQuery(q, 0xA202, "stale.example-test.org", 1, false);
+    uint64_t t0 = nowUs();
+    c.send(q, n);
+    int rn = c.recv(r, sizeof(r), 1500);
+    double ms = (nowUs() - t0) / 1000.0;
+    uint32_t ttl = rn > 0 ? (((uint32_t)r[n + 6] << 24) | ((uint32_t)r[n + 7] << 16) | ((uint32_t)r[n + 8] << 8) | r[n + 9]) : 0;
+    CHECK(rn > 0 && r[0] == 0xA2 && r[1] == 0x02 && r[7] == 1, "expired answer served stale while upstream is down");
+    CHECK(ttl == 30 && sr.srv.stats().staleServed == 1 && sr.srv.stats().timeouts == 0, "stale answer has TTL 30 (ttl=%u stale=%u)", ttl, sr.srv.stats().staleServed);
+    CHECK(ms < 600, "stale answer after one resend, not a client-side timeout (%.0f ms)", ms);
+  }
+  {
+    FakeUpstream up("127.0.0.1", 0, 5);
+    ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 100);
+    sr.srv.setProbeInterval(60);
+    std::this_thread::sleep_for(std::chrono::milliseconds(450));
+    DnsStats st = sr.srv.stats();
+    CHECK(st.probeOk >= 3 && st.probeFail == 0 && sr.srv.msSinceUpstreamOk() < 200, "heartbeat probes answered (ok=%u since=%u ms)", st.probeOk, sr.srv.msSinceUpstreamOk());
+    up.delayMs = 600000;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(sr.srv.stats().probeFail >= 1, "unanswered probes are counted as failures (%u)", sr.srv.stats().probeFail);
+  }
+}
+
+static void testTcpServer() {
+  printf("[dns server: TCP]\n");
+  uint8_t q[512];
+  FakeTcpUpstream tup;
+  FakeUpstream up("127.0.0.1", tup.port, 5);                  // same port number for UDP and TCP
+  ServerRunner sr(g_matcher, inet_addr("127.0.0.1"), 0, up.port, 800, true);
+  sr.startTcp();
+  size_t n = buildQuery(q, 0xB001, "metrics.ads.tracker.io", 1, false);
+  std::vector<uint8_t> r = tcpQuery(sr.port, q, n);
+  CHECK(r.size() > 12 && r[0] == 0xB0 && r[1] == 0x01 && r[7] == 1 && memcmp(&r[r.size() - 4], "\0\0\0\0", 4) == 0, "blocked name answered 0.0.0.0 over TCP");
+  n = buildQuery(q, 0xB002, "use-application-dns.net", 1, false);
+  r = tcpQuery(sr.port, q, n);
+  CHECK(r.size() >= 12 && (r[3] & 0x0F) == 3, "canary -> NXDOMAIN over TCP");
+  n = buildQuery(q, 0xB003, "tcp.forward.test", 1, false);
+  r = tcpQuery(sr.port, q, n);
+  CHECK(r.size() > 12 && r[0] == 0xB0 && r[1] == 0x03 && r[7] == 1 && tup.received == 1, "forwarded to the upstream over TCP (upstream saw %d)", tup.received.load());
+  n = buildQuery(q, 0xB004, "tcp.forward.test", 1, false);
+  r = tcpQuery(sr.port, q, n);
+  CHECK(r.size() > 12 && r[1] == 0x04 && tup.received == 1 && sr.srv.stats().cacheHits >= 1, "repeat answered from the cache (upstream saw %d)", tup.received.load());
+  tup.big = true;
+  n = buildQuery(q, 0xB005, "big.txt.test", 16, false);
+  r = tcpQuery(sr.port, q, n);
+  CHECK(r.size() > 1200 && r[1] == 0x05, "1.2 KB reply passes through TCP intact (%zu bytes)", r.size());
+  r = tcpQuery(sr.port, q, n);
+  CHECK(r.size() > 1200 && tup.received == 3, "oversized replies are not cached (upstream saw %d)", tup.received.load());
+  CHECK(sr.srv.stats().tcpQueries >= 6, "TCP queries counted (%u)", sr.srv.stats().tcpQueries);
+  {
+    ServerRunner dead(g_matcher, inet_addr("127.0.0.1"), 0, 1, 300, true);     // nothing listens on TCP port 1
+    dead.startTcp();
+    n = buildQuery(q, 0xB006, "nobody.tcp.test", 1, false);
+    r = tcpQuery(dead.port, q, n);
+    CHECK(r.size() >= 12 && r[1] == 0x06 && (r[3] & 0x0F) == 2, "upstream down -> SERVFAIL, not a hung connection");
+  }
+}
+
 int main() {
   testSha();
   testHash();
@@ -622,6 +816,8 @@ int main() {
   testServerRetryTimeoutOverflow();
   testOwnUpstreamAndParallel();
   testCnameCanaryTruncation();
+  testCacheAndStale();
+  testTcpServer();
   printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail ? 1 : 0;
 }

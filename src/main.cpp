@@ -165,16 +165,30 @@ static c3::MemStore memStore;
 static FlashReadStore readStore;
 static const char* blMode = "-";
 
+// Erase in 64 KB pieces with a short pause between them: every flash operation stalls code running from flash,
+// and a long uninterrupted erase would make the DNS task miss queries.
+static bool eraseBlocklist(size_t len) {
+  const size_t chunk = 64 * 1024;
+  for (size_t off = 0; off < len; off += chunk) {
+    size_t n = len - off < chunk ? len - off : chunk;
+    if (esp_partition_erase_range(partBl, off, n) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+  return true;
+}
+
 static uint32_t blCapacity() { return partBl ? (uint32_t)((partBl->size - c3::BL_HEADER_SIZE) / c3::BL_HASH_SIZE) : 0; }
 
 static uint32_t effectiveBloomBytes() {
   uint32_t kb = cfg.bloomKb;
   uint32_t freeKb = ESP.getFreeHeap() / 1024;
-  if (kb == 0) {  // automatic: use what is left after a 100 KB runtime reserve
-    kb = freeKb > 100 ? freeKb - 100 : 0;
+  // Reserve for what is allocated after the list loads: DNS/TCP task stacks (~12 KB), the answer cache (up to 16 KB),
+  // Wi-Fi buffers, lwIP, web server connections and TLS.
+  if (kb == 0) {  // automatic: use what is left after a 128 KB reserve
+    kb = freeKb > 128 ? freeKb - 128 : 0;
     if (kb > 256) kb = 256;
   } else {
-    uint32_t cap = freeKb > 64 ? freeKb - 64 : 0;  // keep 64 KB for Wi-Fi buffers, lwIP, web server, TLS
+    uint32_t cap = freeKb > 96 ? freeKb - 96 : 0;
     if (kb > cap) kb = cap;
   }
   return kb >= 4 ? kb * 1024 : 0;
@@ -290,7 +304,7 @@ class BlSink : public Stream {
         unloadBlocklist();
         size_t eraseLen = (c3::BL_HEADER_SIZE + expected_ + 4095) & ~(size_t)4095;
         erased_ = true;
-        if (esp_partition_erase_range(partBl, 0, eraseLen) != ESP_OK) return fail("flash erase failed");
+        if (!eraseBlocklist(eraseLen)) return fail("flash erase failed");
       }
       hdrOk_ = true;
     }
@@ -339,6 +353,7 @@ class BlSink : public Stream {
         if (esp_partition_write(partBl, c3::BL_HEADER_SIZE + woff_, wbuf_, 4096) != ESP_OK) return false;
         woff_ += 4096;
         wfill_ = 0;
+        vTaskDelay(1);  // let the DNS task run between flash writes
       }
     }
     return true;
@@ -448,6 +463,11 @@ static void doBlocklistUpdate() {
   }
   uint8_t sha[32];
   memcpy(sha, verify.info().sha, 32);
+  if (blValid && memcmp(sha, blInfo.sha, 32) == 0) {  // nothing changed: do not erase a working list
+    restoreBloom();
+    finishUpdate(true, "already up to date");
+    return;
+  }
   setMsg("Installing (pass 2)...", 46);
   BlSink install(BlSink::WRITE, sha, 46, 50);
   bool ok = httpStream(url, install, err) && install.finish() && verifyFlash(install.info());
@@ -580,7 +600,10 @@ static String statusJson() {
   j += ",\"dns\":{\"total\":" + String(d.total) + ",\"blocked\":" + String(d.blocked) + ",\"forwarded\":" + String(d.forwarded) +
        ",\"answered\":" + String(d.answered) + ",\"timeouts\":" + String(d.timeouts) + ",\"retried\":" + String(d.retried) +
        ",\"overflow\":" + String(d.overflow) + ",\"pending\":" + String(dnsServer.pending()) + ",\"cname\":" + String(d.cnameBlocked) +
-       ",\"trunc\":" + String(d.truncated) + ",\"canary\":" + String(d.canary) + "}";
+       ",\"trunc\":" + String(d.truncated) + ",\"canary\":" + String(d.canary) + ",\"chit\":" + String(d.cacheHits) +
+       ",\"cmiss\":" + String(d.cacheMisses) + ",\"stale\":" + String(d.staleServed) + ",\"tcp\":" + String(d.tcpQueries) +
+       ",\"slow\":" + String(d.slow) + ",\"rtt\":" + String(d.rttAvg) + ",\"rttmax\":" + String(d.rttMax) +
+       ",\"pok\":" + String(d.probeOk) + ",\"pfail\":" + String(d.probeFail) + ",\"since\":" + String(dnsServer.msSinceUpstreamOk()) + "}";
   j += ",\"match\":{\"queries\":" + String(m.queries) + ",\"misses\":" + String(m.misses) + ",\"noflash\":" + String(m.missesNoFlash) +
        ",\"searches\":" + String(m.flashSearches) + "}";
   j += ",\"bloom\":{\"on\":" + String(matcher.hasBloom() ? "true" : "false") + ",\"kb\":" + String(matcher.bloomBytes() / 1024) +
@@ -883,14 +906,24 @@ static void dnsTask(void*) {
   for (;;) dnsServer.step(20);
 }
 
+static void tcpTask(void*) {
+  for (;;) dnsServer.tcpStep(200);
+}
+
 static void startDns() {
   uint32_t ip1 = 0;
   uint16_t p1 = 53;
   parseUpstream(cfg.up1, ip1, p1);
   if (dnsServer.begin(53, ip1, 0)) {
     applyUpstreams();
-    xTaskCreate(dnsTask, "dns", 6144, nullptr, 5, nullptr);
-    Serial.println("[c3hole] DNS server listening on :53");
+    dnsServer.setProbeInterval(15000);  // heartbeat: keeps Wi-Fi busy, measures upstream health
+    bool tcpOk = dnsServer.beginTcp(53);
+    // lwIP can queue only 6 UDP datagrams per socket (CONFIG_LWIP_UDP_RECVMBOX_SIZE) and its task runs at priority 18.
+    // A DNS task below that lets bursts (one web page = dozens of lookups) overflow the queue and silently drop queries.
+    // Above it, every arriving datagram is consumed immediately.
+    xTaskCreate(dnsTask, "dns", 7168, nullptr, 20, nullptr);
+    if (tcpOk) xTaskCreate(tcpTask, "dnstcp", 5120, nullptr, 4, nullptr);
+    Serial.printf("[c3hole] DNS server listening on :53 (UDP%s)\n", tcpOk ? "+TCP" : ", TCP failed");
   } else {
     Serial.println("[c3hole] ERROR: could not bind UDP :53");
   }
@@ -1022,6 +1055,16 @@ void loop() {
         applyRadio();
       }
       if (down > 300000UL) { Serial.println("[c3hole] Wi-Fi down for 5 min: rebooting"); delay(100); ESP.restart(); }
+    }
+
+    // Link watchdog: the ESP32 sometimes stays "connected" while its data path is dead. The heartbeat probes make that visible.
+    static uint32_t lastLinkKick = 0;
+    if (up && dnsServer.running() && dnsServer.msSinceUpstreamOk() > 90000UL && now - lastLinkKick > 300000UL) {
+      lastLinkKick = now;
+      Serial.println("[c3hole] no upstream answer for 90 s although Wi-Fi is up: reconnecting");
+      WiFi.disconnect(false, false);
+      WiFi.begin(cfg.ssid, cfg.wifiPass);
+      applyRadio();
     }
 
     // Memory guard: if the heap runs low, give the Bloom filter back so the network stack keeps working.
