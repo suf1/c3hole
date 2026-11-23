@@ -46,7 +46,7 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <div class=row><span>Last update</span><b id=bllast>-</b></div></div>
 
 <div class=card><h2>Bloom filter &amp; lookups</h2>
-<div class=row><span>Filter size / hashes</span><b id=bsz>-</b></div><div class=row><span>Estimated false positives</span><b id=bfp>-</b></div>
+<div class=row><span>Filter size / hashes</span><b id=bsz>-</b></div><div class=row><span>Bloom false-hit rate <small>(costs a flash read, never a wrong block)</small></span><b id=bfp>-</b></div>
 <div class=row><span>Misses with 0 flash reads</span><b id=bnf>-</b></div><div class=row><span>Binary searches</span><b id=bfs>-</b></div>
 <div class=row><span>Free heap (min)</span><b id=heap>-</b></div><div class=row><span>Uptime</span><b id=up>-</b></div>
 <div class=row><span>Wi-Fi</span><b id=wifi>-</b></div></div>
@@ -58,7 +58,7 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <small>Queries answered from cache never wait for the internet; stale answers keep sites working if the upstream briefly fails.</small></div>
 
 <div class=card><h2>System health</h2>
-<div class=row><span>Chip temperature</span><b id=temp>-</b></div><div class=row><span>CPU</span><b id=cpu>-</b></div>
+<div class=row><span>Chip temperature</span><b id=temp>-</b></div><div class=row><span>CPU</span><b id=cpumhz>-</b></div>
 <div class=row><span>Last restart reason</span><b id=reset>-</b></div><div class=row><span>Wi-Fi drops (last reason)</span><b id=drops>-</b></div>
 <div class=row><span>Largest free block</span><b id=maxblk>-</b></div><div class=row><span>Low-memory events</span><b id=lowheap>-</b></div>
 <small>If the dashboard ever disappears, these show why after it comes back (power, crash, Wi-Fi or memory).</small></div>
@@ -92,7 +92,7 @@ label{font-size:12px;color:var(--mu)}.ok{color:var(--ok)}.bad{color:var(--bad)}u
 <label>Wi-Fi transmit power (lower = cooler, shorter range)</label><select id=txpower>
 <option value=8>2 dBm</option><option value=20>5 dBm</option><option value=28>7 dBm</option><option value=34>8.5 dBm</option><option value=44>11 dBm</option>
 <option value=52>13 dBm</option><option value=60>15 dBm</option><option value=68>17 dBm</option><option value=74>18.5 dBm</option><option value=76>19 dBm</option><option value=78>19.5 dBm</option></select>
-<label>Wi-Fi power save (cooler, slightly slower replies)</label><select id=ps><option value=0>Off - fastest</option><option value=1>Minimum modem sleep</option><option value=2>Maximum modem sleep</option></select>
+<label>Wi-Fi power save <small>(for a DNS server keep Off: sleeping can add 100-300 ms to every reply)</small></label><select id=ps><option value=0>Off - fastest</option><option value=1>Minimum modem sleep</option><option value=2>Maximum modem sleep</option></select>
 <label>CPU speed (80 MHz runs cooler; applies after reboot)</label><select id=cpu><option value=160>160 MHz</option><option value=80>80 MHz</option></select>
 <button onclick=saveCfg()>Save radio settings</button>
 <small>If the chip runs hot or Wi-Fi keeps dropping, try 8.5 dBm first.</small></div>
@@ -133,7 +133,7 @@ $('bsz').textContent=b.on?(b.kb+' KB / k='+b.k):'off (low RAM)';$('bfp').textCon
 $('bnf').textContent=m.misses?(100*m.noflash/m.misses).toFixed(1)+'%':'-';$('bfs').textContent=fmt(m.searches);
 $('heap').textContent=Math.round(s.heap.free/1024)+' KB ('+Math.round(s.heap.min/1024)+' KB)';$('up').textContent=dur(s.uptime);
 $('wifi').textContent=s.wifi.ssid+' '+s.wifi.rssi+' dBm '+s.wifi.ip;
-const y=s.sys;$('temp').textContent=y.temp.toFixed(0)+' C';$('cpu').textContent=y.cpu+' MHz';$('reset').textContent=y.reset;
+const y=s.sys;$('temp').textContent=y.temp.toFixed(0)+' C';$('cpumhz').textContent=y.cpu+' MHz';$('reset').textContent=y.reset;
 $('drops').textContent=y.drops+(y.drops?' (reason '+y.disc+')':'');$('maxblk').textContent=Math.round(s.heap.maxblk/1024)+' KB';$('lowheap').textContent=y.lowheap;
 $('authst').textContent=s.cfg.noauth?'OFF - open to your network':'on';$('authst').className=s.cfg.noauth?'bad':'ok';
 list($('recent'),s.recent,x=>x);list($('clients'),s.clients,c=>c.ip+'  '+fmt(c.total)+' q, '+fmt(c.blocked)+' blocked');

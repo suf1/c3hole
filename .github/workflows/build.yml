@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: pip install pyserial
       - run: sh tests/run_tests.sh
 
   build:
@@ -59,7 +60,8 @@ jobs:
       - name: Build flasher exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name C3HoleFlasher
-          --paths tools --paths flasher --add-data "flasher/assets;assets" --collect-all esptool
+          --paths tools --paths flasher --hidden-import core --hidden-import gui --hidden-import mdui
+          --add-data "flasher/assets;assets" --collect-all esptool
           flasher/app.py
 
       - name: Self-test (built exe)

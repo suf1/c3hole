@@ -98,6 +98,28 @@ get through. The usual reasons, most likely first:
 Quick checks from a PC: `nslookup doubleclick.net <C3Hole IP>` must answer 0.0.0.0 every time, and
 `Get-DnsClientServerAddress` must list only the C3Hole address for IPv4 *and* IPv6.
 
+## Flasher 2.0 (Material interface)
+
+![Setup page](docs/flasher-setup-light.png)
+
+* **Three pages and a log**, one tap away in the left rail (Setup, Network, Device, Log), with smooth page transitions.
+* **Live validation:** fields turn red with a plain-language message as you leave them; pressing Flash with a problem jumps to the
+  page and field that needs attention. The bottom bar always says what is missing or "Ready".
+* **Light and dark themes** (follows Windows, toggle in the top bar, remembered).
+* **One confirmation** ("Ready to flash?") that spells out what will happen, instead of a chain of pop-ups.
+* **Flashing view:** a step indicator (Prepare, Erase, Write, Boot, Verify), animated progress and plain-English status
+  ("Writing firmware...", "Waiting for the board to join Wi-Fi...").
+* **Result card:** dashboard link, username, password with a Copy button, login check, and the next step; failures explain what
+  stopped and what to try (BOOT/RESET hint, other cable) and offer *Show details*.
+* The board is detected automatically (a toast announces it when you plug it in). Ctrl+Enter flashes.
+
+| Network page (dark) | Result |
+|---|---|
+| ![Network](docs/flasher-network-dark.png) | ![Success](docs/flasher-success-dark.png) |
+
+The previews above are rendered by the project's own UI code with sample data. The interface is built from a small widget kit
+drawn on the standard library's Canvas (`flasher/mdui.py`), so the `.exe` gains no new dependencies.
+
 ## Upstream DNS (including your own server)
 
 Pick a provider preset or type any IPv4 address, optionally with a port: `192.168.0.5` or `192.168.0.5:5353`
@@ -111,7 +133,8 @@ Default: 8.8.8.8 + 9.9.9.9 (two providers).
 
 * **Wi-Fi transmit power**, 2 to 19.5 dBm (default 11). Lower runs cooler; on SuperMini boards with weak antennas,
   8.5 dBm often makes Wi-Fi *more* stable.
-* **Wi-Fi power save**: off (fastest, default), minimum or maximum modem sleep (cooler, but adds latency to replies).
+* **Wi-Fi power save**: **off (default, recommended for a DNS server)**. Modem sleep is cooler, but the radio only wakes at the
+  router's beacons, which can add 100-300 ms to replies and make clients give up on a slow resolver.
 * **CPU speed**: 160 MHz (default) or 80 MHz (cooler; applies after reboot).
 * The dashboard shows chip temperature.
 
